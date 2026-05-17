@@ -53,6 +53,7 @@
 #include "util/tasks/godot/threaded_task_gd.h"
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
+#include "meshers/hybrid/voxel_mesher_hybrid.h"
 #include "meshers/transvoxel/voxel_mesher_transvoxel.h"
 #endif
 
@@ -331,6 +332,7 @@ void initialize_voxel_module(ModuleInitializationLevel p_level) {
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 		ClassDB::register_class<VoxelMesherTransvoxel>();
+		ClassDB::register_class<VoxelMesherHybrid>();
 #endif
 
 #ifdef VOXEL_ENABLE_MODIFIERS

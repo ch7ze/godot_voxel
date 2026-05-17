@@ -206,7 +206,10 @@ def get_sources(env, is_editor_build):
 
         sources += [
             "meshers/transvoxel/*.cpp",
-            
+
+            # Hybrid mesher reuses VoxelMesherTransvoxel, so it depends on smooth meshing.
+            "meshers/hybrid/*.cpp",
+
             "engine/detail_rendering/detail_rendering.cpp",
             "engine/detail_rendering/render_detail_texture_task.cpp",
 
