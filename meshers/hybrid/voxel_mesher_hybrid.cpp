@@ -141,17 +141,40 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 	const int sx = block_size.x;
 	const int sz = block_size.z;
 
-	// Pass 1: for every (x,z) column, find the lowest model voxel (-1 = none).
-	StdVector<int> column_model_y;
-	column_model_y.resize(sx * sz, -1);
+	// Pass 1: build the per-column flatten height.
+	//
+	// A model voxel at (mx, my, mz) occupies the world box (mx..mx+1, my..my+1, mz..mz+1):
+	// its bottom face is the square at height `my` spanning columns mx..mx+1 x mz..mz+1.
+	// Transvoxel meshes the surface under that face from the cell at (mx, my-1, mz), whose
+	// four UPPER corners are the columns (mx,mz), (mx+1,mz), (mx,mz+1), (mx+1,mz+1).
+	//
+	// So to make a model sit flush on all four of its bottom edges, all FOUR of those corner
+	// columns must be flattened to `my` -- not just the model's own column (which would tilt
+	// the surface toward one corner), and not the whole 3x3 neighborhood (which lifts a plateau
+	// and leaves ridges). `column_flatten_y` records, per column, the highest model bottom that
+	// claims it as a corner: if several models of different heights share a column, the highest
+	// keeps every model flush (lower ones embed slightly instead of floating).
+	StdVector<int> column_flatten_y;
+	column_flatten_y.resize(sx * sz, -1);
 	bool any_model = false;
 	for (int z = 0; z < sz; ++z) {
 		for (int x = 0; x < sx; ++x) {
 			for (int y = 0; y < block_size.y; ++y) {
-				if (src.get_voxel(Vector3i(x, y, z), type_channel) != blocky::AIR_ID) {
-					column_model_y[x + z * sx] = y;
-					any_model = true;
-					break;
+				if (src.get_voxel(Vector3i(x, y, z), type_channel) == blocky::AIR_ID) {
+					continue;
+				}
+				any_model = true;
+				// This model voxel claims its 4 bottom-face corner columns at height y.
+				for (int cz = z; cz <= z + 1; ++cz) {
+					for (int cx = x; cx <= x + 1; ++cx) {
+						if (cx < 0 || cx >= sx || cz < 0 || cz >= sz) {
+							continue;
+						}
+						int &slot = column_flatten_y[cx + cz * sx];
+						if (y > slot) {
+							slot = y;
+						}
+					}
 				}
 			}
 		}
@@ -162,65 +185,25 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 
 	bool any_flattened = false;
 
-	// Pass 2: adjust the SDF so each model sits flush, like a small step cut into the slope.
-	//
-	// A model column itself is hard-flattened to the model's bottom edge: the surface must be
-	// exactly there, that is where the model rests.
-	//
-	// Neighbor columns are not replaced; instead the original SDF is combined with the model's
-	// support plane via an SDF union (the minimum of the two signed distances). Union means the
-	// ground is only raised where it lies below the plane, and stays original everywhere else.
-	// This produces a smooth wedge from the flat model platform down to the surrounding terrain
-	// instead of an abrupt hard-edged plateau, and several nearby models combine naturally.
-	//
-	// Transvoxel interpolates a cell from all 4 corner columns, so adjusting the immediate
-	// neighbors is what makes the terrain meet the model cleanly.
+	// Pass 2: in every claimed corner column, combine the SDF with the model support plane
+	// via an SDF union:  sdf(y) = min( original_sdf(y), y - flatten_y ).
+	// `y - flatten_y` is the signed distance to the horizontal plane at the model bottom.
+	// The union (minimum) raises the ground only where it lies below that plane and keeps the
+	// original ground where it is already higher, so:
+	//   - model over a dip   -> ground is lifted up to the model bottom (flush on all 4 edges),
+	//   - model on a slope   -> uphill ground stays higher and the model embeds into the slope.
+	// Columns outside the claimed corners are left untouched, so Transvoxel interpolates a
+	// smooth slope from the flattened square down to the surrounding terrain.
 	for (int z = 0; z < sz; ++z) {
 		for (int x = 0; x < sx; ++x) {
-			const int self_model_y = column_model_y[x + z * sx];
-
-			if (self_model_y >= 0) {
-				// Model column: hard flatten to the model's bottom edge.
-				// Signed distance to that horizontal plane is (y - self_model_y).
-				for (int y = 0; y < block_size.y; ++y) {
-					dst.set_voxel_f(static_cast<float>(y - self_model_y), Vector3i(x, y, z), sdf_channel);
-				}
-				any_flattened = true;
+			const int flatten_y = column_flatten_y[x + z * sx];
+			if (flatten_y < 0) {
 				continue;
 			}
-
-			// Non-model column: find the nearest model voxel in the 3x3 neighborhood.
-			// Picking the nearest (not the first found) keeps the support plane consistent
-			// when several models of different heights are close together.
-			int support_y = -1;
-			int best_dist_sq = 0;
-			for (int dz = -1; dz <= 1; ++dz) {
-				for (int dx = -1; dx <= 1; ++dx) {
-					const int nx = x + dx;
-					const int nz = z + dz;
-					if (nx < 0 || nx >= sx || nz < 0 || nz >= sz) {
-						continue;
-					}
-					const int my = column_model_y[nx + nz * sx];
-					if (my < 0) {
-						continue;
-					}
-					const int dist_sq = dx * dx + dz * dz;
-					if (support_y < 0 || dist_sq < best_dist_sq) {
-						support_y = my;
-						best_dist_sq = dist_sq;
-					}
-				}
-			}
-			if (support_y < 0) {
-				continue;
-			}
-
-			// SDF union with the model's support plane: min(original, distance-to-plane).
 			for (int y = 0; y < block_size.y; ++y) {
 				const Vector3i pos(x, y, z);
 				const float original = dst.get_voxel_f(pos, sdf_channel);
-				const float plane = static_cast<float>(y - support_y);
+				const float plane = static_cast<float>(y - flatten_y);
 				const float unified = original < plane ? original : plane;
 				if (unified != original) {
 					dst.set_voxel_f(unified, pos, sdf_channel);
