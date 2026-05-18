@@ -29,6 +29,7 @@
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 #include "voxel/test_transvoxel.h"
+#include "voxel/test_voxel_mesher_hybrid.h"
 #ifdef VOXEL_ENABLE_GPU
 #include "voxel/test_detail_rendering_gpu.h"
 #endif
@@ -169,6 +170,7 @@ void run_voxel_tests(const testing::TestOptions &options) {
 	VOXEL_TEST(test_voxel_graph_constant_reduction);
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 	VOXEL_TEST(test_transvoxel_issue772);
+	VOXEL_TEST(test_voxel_mesher_hybrid);
 #endif
 #ifdef VOXEL_ENABLE_INSTANCER
 	VOXEL_TEST(test_instance_generator_material_filter_issue774);

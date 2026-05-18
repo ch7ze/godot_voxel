@@ -216,6 +216,9 @@ def get_sources(env, is_editor_build):
             "thirdparty/meshoptimizer/*.cpp"
         ]
 
+        if tests_enabled:
+            sources += ["tests/voxel/test_voxel_mesher_hybrid.cpp"]
+
         if gpu_enabled:
             sources += ["engine/detail_rendering/render_detail_texture_gpu_task.cpp"]
 
