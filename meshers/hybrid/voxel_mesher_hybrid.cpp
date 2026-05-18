@@ -72,6 +72,37 @@ bool VoxelMesherHybrid::is_generating_collision_surface() const {
 	return _transvoxel_mesher->is_generating_collision_surface();
 }
 
+Ref<Material> VoxelMesherHybrid::get_material_by_index(unsigned int index) const {
+	// Surface 0 = smooth terrain, surface 1 = blocky models.
+	if (index == 0) {
+		return _terrain_material;
+	}
+	if (index == 1) {
+		return _model_material;
+	}
+	return Ref<Material>();
+}
+
+unsigned int VoxelMesherHybrid::get_material_index_count() const {
+	return 2;
+}
+
+void VoxelMesherHybrid::set_terrain_material(Ref<Material> material) {
+	_terrain_material = material;
+}
+
+Ref<Material> VoxelMesherHybrid::get_terrain_material() const {
+	return _terrain_material;
+}
+
+void VoxelMesherHybrid::set_model_material(Ref<Material> material) {
+	_model_material = material;
+}
+
+Ref<Material> VoxelMesherHybrid::get_model_material() const {
+	return _model_material;
+}
+
 void VoxelMesherHybrid::set_library(Ref<VoxelBlockyLibraryBase> library) {
 	_library = library;
 }
@@ -80,12 +111,168 @@ Ref<VoxelBlockyLibraryBase> VoxelMesherHybrid::get_library() const {
 	return _library;
 }
 
+void VoxelMesherHybrid::set_flatten_terrain_under_models(bool enabled) {
+	_flatten_terrain_under_models = enabled;
+}
+
+bool VoxelMesherHybrid::get_flatten_terrain_under_models() const {
+	return _flatten_terrain_under_models;
+}
+
+bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher::Input &input) const {
+	ZN_PROFILE_SCOPE();
+
+	const VoxelBuffer &src = input.voxels;
+	const VoxelBuffer::ChannelId sdf_channel = VoxelBuffer::CHANNEL_SDF;
+	const VoxelBuffer::ChannelId type_channel = VoxelBuffer::CHANNEL_TYPE;
+
+	if (src.is_uniform(type_channel) && src.get_voxel(Vector3i(), type_channel) == blocky::AIR_ID) {
+		// No models: no flattening needed, the original SDF can be used directly.
+		return false;
+	}
+
+	const Vector3i block_size = src.get_size();
+
+	// Work on an own copy of the SDF channel so the original (const) buffer is untouched.
+	dst.create(block_size);
+	dst.set_channel_depth(sdf_channel, src.get_channel_depth(sdf_channel));
+	dst.copy_channel_from(src, sdf_channel);
+
+	const int sx = block_size.x;
+	const int sz = block_size.z;
+
+	// Original ground surface height of a column: lowest y where the SDF turns from
+	// solid (<= 0) to air (> 0). Returns block_size.y if the column is solid all the way up,
+	// or 0 if it is air all the way down.
+	const auto ground_height = [&src, &block_size, sdf_channel](int x, int z) -> int {
+		for (int y = 0; y < block_size.y; ++y) {
+			if (src.get_voxel_f(Vector3i(x, y, z), sdf_channel) > 0.f) {
+				return y;
+			}
+		}
+		return block_size.y;
+	};
+
+	// Pass 1: for every (x,z) column, find the lowest model voxel (-1 = none).
+	StdVector<int> column_model_y;
+	column_model_y.resize(sx * sz, -1);
+	bool any_model = false;
+	for (int z = 0; z < sz; ++z) {
+		for (int x = 0; x < sx; ++x) {
+			for (int y = 0; y < block_size.y; ++y) {
+				if (src.get_voxel(Vector3i(x, y, z), type_channel) != blocky::AIR_ID) {
+					column_model_y[x + z * sx] = y;
+					any_model = true;
+					break;
+				}
+			}
+		}
+	}
+	if (!any_model) {
+		return false;
+	}
+
+	bool any_flattened = false;
+
+	// Pass 2: adjust the SDF around model voxels so each model sits like a step cut into the
+	// slope. For every column:
+	//  - If it holds a model itself, flatten to that model's bottom edge (model_y).
+	//  - Otherwise, if a neighboring column holds a model, decide per the original ground:
+	//      * neighbor ground HIGHER than the model top  -> attach terrain at the model TOP
+	//        edge (model_y + 1): the model is embedded into the rising slope,
+	//      * neighbor ground LOWER than the model bottom -> attach at the BOTTOM edge
+	//        (model_y): the model stands above the falling slope,
+	//      * in between -> leave the original SDF, Transvoxel blends it smoothly.
+	// Transvoxel interpolates a cell from all 4 corner columns, so adjusting the immediate
+	// neighbors is what makes the terrain meet the model cleanly instead of forming a wedge.
+	for (int z = 0; z < sz; ++z) {
+		for (int x = 0; x < sx; ++x) {
+			const int self_model_y = column_model_y[x + z * sx];
+
+			if (self_model_y >= 0) {
+				// This column holds a model: flatten to its bottom edge.
+				for (int y = 0; y < block_size.y; ++y) {
+					dst.set_voxel_f(static_cast<float>(y - self_model_y), Vector3i(x, y, z), sdf_channel);
+				}
+				any_flattened = true;
+				continue;
+			}
+
+			// No model here: check if a neighbor column has one.
+			int neighbor_model_y = -1;
+			for (int dz = -1; dz <= 1 && neighbor_model_y < 0; ++dz) {
+				for (int dx = -1; dx <= 1; ++dx) {
+					const int nx = x + dx;
+					const int nz = z + dz;
+					if (nx < 0 || nx >= sx || nz < 0 || nz >= sz) {
+						continue;
+					}
+					const int my = column_model_y[nx + nz * sx];
+					if (my >= 0) {
+						neighbor_model_y = my;
+						break;
+					}
+				}
+			}
+			if (neighbor_model_y < 0) {
+				continue;
+			}
+
+			const int model_bottom = neighbor_model_y;
+			const int model_top = neighbor_model_y + 1;
+			const int gh = ground_height(x, z);
+
+			int attach_y;
+			if (gh >= model_top) {
+				// Rising slope: terrain meets the model at its top edge.
+				attach_y = model_top;
+			} else if (gh <= model_bottom) {
+				// Falling slope: terrain meets the model at its bottom edge.
+				attach_y = model_bottom;
+			} else {
+				// Ground passes through the model's height range: keep the original SDF
+				// so Transvoxel blends naturally.
+				continue;
+			}
+
+			for (int y = 0; y < block_size.y; ++y) {
+				dst.set_voxel_f(static_cast<float>(y - attach_y), Vector3i(x, y, z), sdf_channel);
+			}
+			any_flattened = true;
+		}
+	}
+
+	return any_flattened;
+}
+
 void VoxelMesherHybrid::build(VoxelMesher::Output &output, const VoxelMesher::Input &input) {
 	ZN_PROFILE_SCOPE();
 
 	// Surface 0: smooth SDF terrain, delegated to the reused Transvoxel mesher.
 	// It appends its surface(s) and sets collision_surface / mesh_flags / primitive_type.
-	_transvoxel_mesher->build(output, input);
+	if (_flatten_terrain_under_models && !_library.is_null()) {
+		// Thread-local: build() may run on several threads at once.
+		thread_local VoxelBuffer tls_flattened_sdf(VoxelBuffer::ALLOCATOR_POOL);
+		if (build_flattened_sdf(tls_flattened_sdf, input)) {
+			// Mesh the smooth surface from the flattened SDF copy instead of the original.
+			// Input.voxels is a reference, so a new Input must be constructed rather than
+			// reassigned. All other fields are forwarded unchanged.
+			const VoxelMesher::Input flattened_input{
+				tls_flattened_sdf,
+				input.generator,
+				input.origin_in_voxels,
+				input.lod_index,
+				input.collision_hint,
+				input.lod_hint,
+				input.detail_texture_hint
+			};
+			_transvoxel_mesher->build(output, flattened_input);
+		} else {
+			_transvoxel_mesher->build(output, input);
+		}
+	} else {
+		_transvoxel_mesher->build(output, input);
+	}
 
 	// Surface 1: sharp-edged 3D models baked from the TYPE channel.
 	build_model_surface(output, input);
@@ -201,6 +388,19 @@ void VoxelMesherHybrid::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_library", "library"), &Self::set_library);
 	ClassDB::bind_method(D_METHOD("get_library"), &Self::get_library);
 
+	ClassDB::bind_method(D_METHOD("set_terrain_material", "material"), &Self::set_terrain_material);
+	ClassDB::bind_method(D_METHOD("get_terrain_material"), &Self::get_terrain_material);
+
+	ClassDB::bind_method(D_METHOD("set_model_material", "material"), &Self::set_model_material);
+	ClassDB::bind_method(D_METHOD("get_model_material"), &Self::get_model_material);
+
+	ClassDB::bind_method(
+			D_METHOD("set_flatten_terrain_under_models", "enabled"), &Self::set_flatten_terrain_under_models
+	);
+	ClassDB::bind_method(
+			D_METHOD("get_flatten_terrain_under_models"), &Self::get_flatten_terrain_under_models
+	);
+
 	ADD_PROPERTY(
 			PropertyInfo(
 					Variant::OBJECT,
@@ -210,6 +410,25 @@ void VoxelMesherHybrid::_bind_methods() {
 			),
 			"set_library",
 			"get_library"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(
+					Variant::OBJECT, "terrain_material", PROPERTY_HINT_RESOURCE_TYPE, "Material"
+			),
+			"set_terrain_material",
+			"get_terrain_material"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(
+					Variant::OBJECT, "model_material", PROPERTY_HINT_RESOURCE_TYPE, "Material"
+			),
+			"set_model_material",
+			"get_model_material"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::BOOL, "flatten_terrain_under_models"),
+			"set_flatten_terrain_under_models",
+			"get_flatten_terrain_under_models"
 	);
 }
 
