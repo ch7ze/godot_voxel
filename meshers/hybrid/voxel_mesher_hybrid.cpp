@@ -141,18 +141,6 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 	const int sx = block_size.x;
 	const int sz = block_size.z;
 
-	// Original ground surface height of a column: lowest y where the SDF turns from
-	// solid (<= 0) to air (> 0). Returns block_size.y if the column is solid all the way up,
-	// or 0 if it is air all the way down.
-	const auto ground_height = [&src, &block_size, sdf_channel](int x, int z) -> int {
-		for (int y = 0; y < block_size.y; ++y) {
-			if (src.get_voxel_f(Vector3i(x, y, z), sdf_channel) > 0.f) {
-				return y;
-			}
-		}
-		return block_size.y;
-	};
-
 	// Pass 1: for every (x,z) column, find the lowest model voxel (-1 = none).
 	StdVector<int> column_model_y;
 	column_model_y.resize(sx * sz, -1);
@@ -174,23 +162,26 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 
 	bool any_flattened = false;
 
-	// Pass 2: adjust the SDF around model voxels so each model sits like a step cut into the
-	// slope. For every column:
-	//  - If it holds a model itself, flatten to that model's bottom edge (model_y).
-	//  - Otherwise, if a neighboring column holds a model, decide per the original ground:
-	//      * neighbor ground HIGHER than the model top  -> attach terrain at the model TOP
-	//        edge (model_y + 1): the model is embedded into the rising slope,
-	//      * neighbor ground LOWER than the model bottom -> attach at the BOTTOM edge
-	//        (model_y): the model stands above the falling slope,
-	//      * in between -> leave the original SDF, Transvoxel blends it smoothly.
+	// Pass 2: adjust the SDF so each model sits flush, like a small step cut into the slope.
+	//
+	// A model column itself is hard-flattened to the model's bottom edge: the surface must be
+	// exactly there, that is where the model rests.
+	//
+	// Neighbor columns are not replaced; instead the original SDF is combined with the model's
+	// support plane via an SDF union (the minimum of the two signed distances). Union means the
+	// ground is only raised where it lies below the plane, and stays original everywhere else.
+	// This produces a smooth wedge from the flat model platform down to the surrounding terrain
+	// instead of an abrupt hard-edged plateau, and several nearby models combine naturally.
+	//
 	// Transvoxel interpolates a cell from all 4 corner columns, so adjusting the immediate
-	// neighbors is what makes the terrain meet the model cleanly instead of forming a wedge.
+	// neighbors is what makes the terrain meet the model cleanly.
 	for (int z = 0; z < sz; ++z) {
 		for (int x = 0; x < sx; ++x) {
 			const int self_model_y = column_model_y[x + z * sx];
 
 			if (self_model_y >= 0) {
-				// This column holds a model: flatten to its bottom edge.
+				// Model column: hard flatten to the model's bottom edge.
+				// Signed distance to that horizontal plane is (y - self_model_y).
 				for (int y = 0; y < block_size.y; ++y) {
 					dst.set_voxel_f(static_cast<float>(y - self_model_y), Vector3i(x, y, z), sdf_channel);
 				}
@@ -198,9 +189,12 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 				continue;
 			}
 
-			// No model here: check if a neighbor column has one.
-			int neighbor_model_y = -1;
-			for (int dz = -1; dz <= 1 && neighbor_model_y < 0; ++dz) {
+			// Non-model column: find the nearest model voxel in the 3x3 neighborhood.
+			// Picking the nearest (not the first found) keeps the support plane consistent
+			// when several models of different heights are close together.
+			int support_y = -1;
+			int best_dist_sq = 0;
+			for (int dz = -1; dz <= 1; ++dz) {
 				for (int dx = -1; dx <= 1; ++dx) {
 					const int nx = x + dx;
 					const int nz = z + dz;
@@ -208,37 +202,31 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 						continue;
 					}
 					const int my = column_model_y[nx + nz * sx];
-					if (my >= 0) {
-						neighbor_model_y = my;
-						break;
+					if (my < 0) {
+						continue;
+					}
+					const int dist_sq = dx * dx + dz * dz;
+					if (support_y < 0 || dist_sq < best_dist_sq) {
+						support_y = my;
+						best_dist_sq = dist_sq;
 					}
 				}
 			}
-			if (neighbor_model_y < 0) {
+			if (support_y < 0) {
 				continue;
 			}
 
-			const int model_bottom = neighbor_model_y;
-			const int model_top = neighbor_model_y + 1;
-			const int gh = ground_height(x, z);
-
-			int attach_y;
-			if (gh >= model_top) {
-				// Rising slope: terrain meets the model at its top edge.
-				attach_y = model_top;
-			} else if (gh <= model_bottom) {
-				// Falling slope: terrain meets the model at its bottom edge.
-				attach_y = model_bottom;
-			} else {
-				// Ground passes through the model's height range: keep the original SDF
-				// so Transvoxel blends naturally.
-				continue;
-			}
-
+			// SDF union with the model's support plane: min(original, distance-to-plane).
 			for (int y = 0; y < block_size.y; ++y) {
-				dst.set_voxel_f(static_cast<float>(y - attach_y), Vector3i(x, y, z), sdf_channel);
+				const Vector3i pos(x, y, z);
+				const float original = dst.get_voxel_f(pos, sdf_channel);
+				const float plane = static_cast<float>(y - support_y);
+				const float unified = original < plane ? original : plane;
+				if (unified != original) {
+					dst.set_voxel_f(unified, pos, sdf_channel);
+					any_flattened = true;
+				}
 			}
-			any_flattened = true;
 		}
 	}
 
@@ -252,19 +240,24 @@ void VoxelMesherHybrid::build(VoxelMesher::Output &output, const VoxelMesher::In
 	// It appends its surface(s) and sets collision_surface / mesh_flags / primitive_type.
 	if (_flatten_terrain_under_models && !_library.is_null()) {
 		// Thread-local: build() may run on several threads at once.
-		thread_local VoxelBuffer tls_flattened_sdf(VoxelBuffer::ALLOCATOR_POOL);
+		// ALLOCATOR_DEFAULT (not POOL): a thread_local buffer outlives single calls and would
+		// otherwise hold VoxelMemoryPool blocks until thread exit, which can happen after the
+		// pool singleton is torn down on module unregister (reported as a recycling leak).
+		thread_local VoxelBuffer tls_flattened_sdf(VoxelBuffer::ALLOCATOR_DEFAULT);
 		if (build_flattened_sdf(tls_flattened_sdf, input)) {
 			// Mesh the smooth surface from the flattened SDF copy instead of the original.
 			// Input.voxels is a reference, so a new Input must be constructed rather than
-			// reassigned. All other fields are forwarded unchanged.
+			// reassigned. Designated initializers are used so every field is named: if the
+			// upstream Input struct gains a field, it keeps its default here instead of a
+			// member being silently shifted to a wrong value.
 			const VoxelMesher::Input flattened_input{
-				tls_flattened_sdf,
-				input.generator,
-				input.origin_in_voxels,
-				input.lod_index,
-				input.collision_hint,
-				input.lod_hint,
-				input.detail_texture_hint
+				.voxels = tls_flattened_sdf,
+				.generator = input.generator,
+				.origin_in_voxels = input.origin_in_voxels,
+				.lod_index = input.lod_index,
+				.collision_hint = input.collision_hint,
+				.lod_hint = input.lod_hint,
+				.detail_texture_hint = input.detail_texture_hint
 			};
 			_transvoxel_mesher->build(output, flattened_input);
 		} else {
