@@ -101,6 +101,36 @@ void test_voxel_mesher_hybrid() {
 		mesher_no_lib->build(output_no_lib, input);
 		ZN_TEST_ASSERT(output_no_lib.surfaces.size() == 1);
 	}
+
+	// Neighbor side-culling: two touching cubes must produce fewer model vertices than two
+	// isolated cubes, because their shared faces are culled.
+	{
+		// Buffer with a single isolated model cube.
+		VoxelBuffer vb_one(VoxelBuffer::ALLOCATOR_DEFAULT);
+		vb_one.create(size, size, size);
+		vb_one.set_channel_depth(VoxelBuffer::CHANNEL_SDF, VoxelBuffer::DEPTH_16_BIT);
+		vb_one.set_channel_depth(VoxelBuffer::CHANNEL_TYPE, VoxelBuffer::DEPTH_16_BIT);
+		for (int z = 0; z < size; ++z) {
+			for (int x = 0; x < size; ++x) {
+				for (int y = 0; y < size; ++y) {
+					const float sdf = static_cast<float>(y) - static_cast<float>(size) * 0.5f;
+					vb_one.set_voxel_f(sdf, Vector3i(x, y, z), VoxelBuffer::CHANNEL_SDF);
+				}
+			}
+		}
+		vb_one.set_voxel(1, Vector3i(6, 9, 6), VoxelBuffer::CHANNEL_TYPE);
+
+		VoxelMesher::Input input_one{ vb_one, nullptr, Vector3i(), 0, false };
+		VoxelMesher::Output output_one;
+		mesher->build(output_one, input_one);
+
+		ZN_TEST_ASSERT(output_one.surfaces.size() == 2);
+		const PackedVector3Array one_cube_vertices = output_one.surfaces[1].arrays[Mesh::ARRAY_VERTEX];
+
+		// `output` above has two adjacent cubes. With culling, they share one face pair, so
+		// their combined vertex count must be less than twice a single isolated cube.
+		ZN_TEST_ASSERT(model_vertices.size() < 2 * one_cube_vertices.size());
+	}
 }
 
 } // namespace zylann::voxel::tests

@@ -8,6 +8,8 @@
 #include "../../util/math/funcs.h"
 #include "../../util/profiling.h"
 #include "../blocky/blocky_baked_library.h"
+// For blocky::is_face_visible (neighbor side-culling), an exported inline helper.
+#include "../blocky/voxel_mesher_blocky.h"
 
 using namespace zylann::godot;
 
@@ -51,13 +53,13 @@ struct SurfaceArrays {
 };
 
 // Accumulates baked model geometry from the TYPE channel, grouped by material id so each
-// material can become its own mesh surface. No neighbor-culling is done: every side surface
-// is baked, even if occluded -- that keeps this step simple and correct; culling is an
-// optimization that can be added later.
+// material can become its own mesh surface. Cube sides occluded by a neighbor voxel are
+// culled (see build_model_surface); inner model geometry is always kept.
 //
 // blocky::generate_mesh (VoxelMesherBlocky) does similar batching but is a file-local
-// template, not exported in any header, and also does culling/AO/tint/collision that this
-// mesher does not need -- so it cannot be reused as-is and this reduced version is kept here.
+// template, not exported in any header, and also does AO/tint this mesher does not need --
+// so it cannot be reused as-is. The neighbor-culling check itself IS reused, via the
+// exported blocky::is_face_visible helper.
 using ModelMeshAccumulator = StdUnorderedMap<uint32_t, SurfaceArrays>;
 
 // Appends a surface's triangles to the collision surface, offsetting indices by the
@@ -384,6 +386,22 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 					// Position relative to the (unpadded) mesh origin.
 					const Vector3f voxel_offset(x - min.x, y - min.y, z - min.z);
 
+					// Neighbor side-culling: a cube side is only baked if its neighbor voxel
+					// does not occlude it. blocky::is_face_visible is the exported helper that
+					// VoxelMesherBlocky itself uses -- it handles air, transparency and the
+					// side-pattern test for non-cube models. The neighbor is read from the
+					// TYPE channel; the padding border carries the neighbor chunk's values,
+					// so this stays correct across chunk boundaries. Computed once per voxel
+					// since visibility depends on the neighbor, not on the surface/material.
+					uint8_t visible_sides_mask = 0;
+					for (unsigned int side = 0; side < Cube::SIDE_COUNT; ++side) {
+						const Vector3i npos = Vector3i(x, y, z) + Cube::g_side_normals[side];
+						const uint64_t neighbor_id = voxels.get_voxel(npos, type_channel);
+						if (blocky::is_face_visible(baked, baked_model, neighbor_id, side)) {
+							visible_sides_mask |= (1 << side);
+						}
+					}
+
 					for (unsigned int s = 0; s < model.surface_count; ++s) {
 						// Inner geometry of the model. Each model surface has its own material
 						// id; geometry is grouped by that id so it becomes its own mesh surface.
@@ -391,9 +409,12 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 						acc[surface.material_id].append_geometry(
 								surface.positions, surface.normals, surface.uvs, surface.indices, voxel_offset
 						);
-						// All 6 cube sides (not culled against neighbors in this step). Side
-						// surfaces share the material id of their parent model surface.
+						// Cube sides: only the ones not occluded by a neighbor. Side surfaces
+						// share the material id of their parent model surface.
 						for (unsigned int side = 0; side < Cube::SIDE_COUNT; ++side) {
+							if ((visible_sides_mask & (1 << side)) == 0) {
+								continue;
+							}
 							const blocky::BakedModel::SideSurface &side_surface = model.sides_surfaces[side][s];
 							acc[surface.material_id].append_geometry(
 									side_surface.positions,
