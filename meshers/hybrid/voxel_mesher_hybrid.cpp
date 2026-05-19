@@ -4,6 +4,8 @@
 #include "../../util/containers/std_unordered_map.h"
 #include "../../util/containers/std_vector.h"
 #include "../../util/godot/core/packed_arrays.h"
+#include "../../util/math/conv.h"
+#include "../../util/math/funcs.h"
 #include "../../util/profiling.h"
 #include "../blocky/blocky_baked_library.h"
 
@@ -58,6 +60,18 @@ struct SurfaceArrays {
 // mesher does not need -- so it cannot be reused as-is and this reduced version is kept here.
 using ModelMeshAccumulator = StdUnorderedMap<uint32_t, SurfaceArrays>;
 
+// Appends a surface's triangles to the collision surface, offsetting indices by the
+// triangles already present so the appended mesh stays consistent.
+void append_to_collision_surface(VoxelMesher::Output::CollisionSurface &col, const SurfaceArrays &src) {
+	const int base = static_cast<int>(col.positions.size());
+	for (const Vector3f &p : src.positions) {
+		col.positions.push_back(p);
+	}
+	for (const int32_t idx : src.indices) {
+		col.indices.push_back(base + idx);
+	}
+}
+
 } // namespace
 
 VoxelMesherHybrid::VoxelMesherHybrid() {
@@ -77,7 +91,10 @@ int VoxelMesherHybrid::get_used_channels_mask() const {
 }
 
 bool VoxelMesherHybrid::is_generating_collision_surface() const {
-	return _transvoxel_mesher->is_generating_collision_surface();
+	// Always true: build() produces an explicit collision_surface (terrain geometry promoted
+	// from Transvoxel's submesh range, plus the model triangles). This does not depend on
+	// what the inner Transvoxel mesher reports -- the hybrid mesher owns its collision output.
+	return true;
 }
 
 Ref<Material> VoxelMesherHybrid::get_material_by_index(unsigned int index) const {
@@ -269,8 +286,54 @@ void VoxelMesherHybrid::build(VoxelMesher::Output &output, const VoxelMesher::In
 		_transvoxel_mesher->build(output, input);
 	}
 
+	// Convert the Transvoxel terrain collision (a submesh range of surface 0) into explicit
+	// collision_surface arrays, so the model triangles can be appended to the same collider.
+	promote_terrain_collision(output);
+
 	// Surface 1: sharp-edged 3D models baked from the TYPE channel.
+	// Also appends the model triangles to output.collision_surface.
 	build_model_surface(output, input);
+}
+
+void VoxelMesherHybrid::promote_terrain_collision(VoxelMesher::Output &output) const {
+	ZN_PROFILE_SCOPE();
+
+	VoxelMesher::Output::CollisionSurface &col = output.collision_surface;
+
+	// Transvoxel reports its collider as a sub-range [0 .. submesh_*) of render surface 0
+	// (the range excludes the LOD transition meshes). To be able to append model triangles,
+	// that range is copied into explicit positions/indices and the submesh markers cleared,
+	// so make_collision_shape_from_mesher_output() uses the explicit arrays instead.
+	if (col.submesh_vertex_end < 0 || output.surfaces.size() == 0) {
+		// Nothing to promote (e.g. empty terrain surface): leave collision_surface as-is.
+		return;
+	}
+
+	const Array &arrays = output.surfaces[0].arrays;
+	if (arrays.size() < Mesh::ARRAY_MAX) {
+		return;
+	}
+	const PackedVector3Array vertices = arrays[Mesh::ARRAY_VERTEX];
+	const PackedInt32Array indices = arrays[Mesh::ARRAY_INDEX];
+
+	const int vertex_end = math::min(col.submesh_vertex_end, static_cast<int32_t>(vertices.size()));
+	const int index_end = math::min(col.submesh_index_end, static_cast<int32_t>(indices.size()));
+
+	col.positions.clear();
+	col.indices.clear();
+	col.positions.reserve(vertex_end);
+	col.indices.reserve(index_end);
+
+	for (int i = 0; i < vertex_end; ++i) {
+		col.positions.push_back(to_vec3f(vertices[i]));
+	}
+	for (int i = 0; i < index_end; ++i) {
+		col.indices.push_back(indices[i]);
+	}
+
+	// Switch to explicit-arrays mode so appended model triangles are included.
+	col.submesh_vertex_end = -1;
+	col.submesh_index_end = -1;
 }
 
 void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const VoxelMesher::Input &input) {
@@ -382,6 +445,10 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 		arrays[Mesh::ARRAY_INDEX] = gd_indices;
 
 		output.surfaces.push_back({ arrays, static_cast<uint16_t>(1 + material_id) });
+
+		// Append the same model geometry to the collision surface so models are solid.
+		// promote_terrain_collision() has already placed the terrain geometry there.
+		append_to_collision_surface(output.collision_surface, sa);
 	}
 }
 

@@ -61,8 +61,14 @@ public:
 	bool get_flatten_terrain_under_models() const;
 
 private:
-	// Builds the blocky model part into `output` (Surface 1). No-op if no library is set.
+	// Builds the blocky model part into `output` (Surface 1, one surface per material).
+	// Also appends the model triangles to `output.collision_surface` so models are solid.
+	// No-op if no library is set.
 	void build_model_surface(VoxelMesher::Output &output, const VoxelMesher::Input &input);
+
+	// Converts the Transvoxel terrain collision (provided as a submesh range of surface 0)
+	// into explicit collision_surface arrays, so model triangles can be appended afterwards.
+	void promote_terrain_collision(VoxelMesher::Output &output) const;
 
 	// Returns true if any model voxel exists, and writes a flattened SDF copy into `dst`.
 	// `dst` is the SDF the smooth surface should be meshed from instead of the original.

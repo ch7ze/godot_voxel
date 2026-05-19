@@ -78,6 +78,21 @@ void test_voxel_mesher_hybrid() {
 	ZN_TEST_ASSERT(model_indices.size() > 0);
 	ZN_TEST_ASSERT((model_indices.size() % 3) == 0);
 
+	// The collision surface must use explicit arrays (submesh markers cleared) and contain
+	// both the terrain geometry and the model triangles, so models are solid.
+	const VoxelMesher::Output::CollisionSurface &col = output.collision_surface;
+	ZN_TEST_ASSERT(col.submesh_vertex_end == -1);
+	ZN_TEST_ASSERT(col.submesh_index_end == -1);
+	ZN_TEST_ASSERT(col.positions.size() > 0);
+	ZN_TEST_ASSERT(col.indices.size() > 0);
+	ZN_TEST_ASSERT((col.indices.size() % 3) == 0);
+	// It must hold more than the terrain alone: at least the model triangles were appended.
+	ZN_TEST_ASSERT(col.positions.size() >= static_cast<size_t>(model_vertices.size()));
+	// Every index must point at a valid vertex.
+	for (const int idx : col.indices) {
+		ZN_TEST_ASSERT(idx >= 0 && idx < static_cast<int>(col.positions.size()));
+	}
+
 	// With no library set, the hybrid mesher must behave like plain Transvoxel (only surface 0).
 	{
 		Ref<VoxelMesherHybrid> mesher_no_lib;
