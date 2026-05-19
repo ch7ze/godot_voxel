@@ -5,6 +5,9 @@
 #include "../../meshers/hybrid/voxel_mesher_hybrid.h"
 #include "../../storage/voxel_buffer.h"
 #include "../../util/godot/classes/mesh.h"
+#include "../../util/godot/classes/rendering_server.h"
+#include "../../util/godot/classes/shader.h"
+#include "../../util/godot/classes/shader_material.h"
 #include "../../util/testing/test_macros.h"
 
 namespace zylann::voxel::tests {
@@ -130,6 +133,82 @@ void test_voxel_mesher_hybrid() {
 		// `output` above has two adjacent cubes. With culling, they share one face pair, so
 		// their combined vertex count must be less than twice a single isolated cube.
 		ZN_TEST_ASSERT(model_vertices.size() < 2 * one_cube_vertices.size());
+	}
+
+	// Shared vertex format: the terrain renders all surfaces with one material_override (the
+	// default LOD shader), so every surface must carry CUSTOM0 (4 floats: Transvoxel LOD
+	// attributes) and CUSTOM1 (1 float: material id), sized to the vertex count.
+	{
+		for (unsigned int s = 0; s < output.surfaces.size(); ++s) {
+			const Array &arrays = output.surfaces[s].arrays;
+			const PackedVector3Array verts = arrays[Mesh::ARRAY_VERTEX];
+			const PackedFloat32Array custom0 = arrays[Mesh::ARRAY_CUSTOM0];
+			const PackedFloat32Array custom1 = arrays[Mesh::ARRAY_CUSTOM1];
+			ZN_TEST_ASSERT(custom0.size() == verts.size() * 4);
+			ZN_TEST_ASSERT(custom1.size() == verts.size() * 1);
+		}
+		// mesh_flags must declare the format of BOTH custom streams. build_mesh() applies one
+		// flags value to every surface; a missing CUSTOM0 field would make Godot read it as
+		// RGBA8_UNORM and reject the PackedFloat32Array.
+		const uint32_t custom0_format =
+				(output.mesh_flags >> RenderingServer::ARRAY_FORMAT_CUSTOM0_SHIFT) & RenderingServer::ARRAY_FORMAT_CUSTOM_MASK;
+		const uint32_t custom1_format =
+				(output.mesh_flags >> RenderingServer::ARRAY_FORMAT_CUSTOM1_SHIFT) & RenderingServer::ARRAY_FORMAT_CUSTOM_MASK;
+		ZN_TEST_ASSERT(custom0_format == RenderingServer::ARRAY_CUSTOM_RGBA_FLOAT);
+		ZN_TEST_ASSERT(custom1_format == RenderingServer::ARRAY_CUSTOM_R_FLOAT);
+	}
+
+	// Regression: a chunk with models but no smooth terrain. The SDF is uniform, so the inner
+	// Transvoxel mesher produces no surface and never sets mesh_flags. The hybrid mesher must
+	// still declare the CUSTOM0 format itself -- otherwise the model surface's CUSTOM0 array
+	// would be rejected by Godot ("Invalid array format for surface").
+	//
+	// Flattening is disabled here: it would union a model support plane into the uniform SDF,
+	// introduce a sign change, and make Transvoxel produce a surface after all -- which would
+	// defeat the "no smooth terrain" condition this case is meant to exercise.
+	{
+		VoxelBuffer vb_models_only(VoxelBuffer::ALLOCATOR_DEFAULT);
+		vb_models_only.create(size, size, size);
+		vb_models_only.set_channel_depth(VoxelBuffer::CHANNEL_SDF, VoxelBuffer::DEPTH_16_BIT);
+		vb_models_only.set_channel_depth(VoxelBuffer::CHANNEL_TYPE, VoxelBuffer::DEPTH_16_BIT);
+		// SDF left at its uniform default (no sign change -> Transvoxel produces nothing).
+		vb_models_only.set_voxel(1, Vector3i(6, 8, 6), VoxelBuffer::CHANNEL_TYPE);
+
+		Ref<VoxelMesherHybrid> mesher_models;
+		mesher_models.instantiate();
+		mesher_models->set_library(library);
+		mesher_models->set_flatten_terrain_under_models(false);
+
+		VoxelMesher::Input input_models{ vb_models_only, nullptr, Vector3i(), 0, false };
+		VoxelMesher::Output output_models;
+		mesher_models->build(output_models, input_models);
+
+		// Only the model surface exists; no smooth terrain surface.
+		ZN_TEST_ASSERT(output_models.surfaces.size() == 1);
+		ZN_TEST_ASSERT(output_models.surfaces[0].material_index == 1);
+
+		// The CUSTOM0 format field must be set even though Transvoxel produced no surface.
+		const uint32_t custom0_format =
+				(output_models.mesh_flags >> RenderingServer::ARRAY_FORMAT_CUSTOM0_SHIFT) &
+				RenderingServer::ARRAY_FORMAT_CUSTOM_MASK;
+		ZN_TEST_ASSERT(custom0_format == RenderingServer::ARRAY_CUSTOM_RGBA_FLOAT);
+
+		// And the model surface must actually carry a matching CUSTOM0 array.
+		const Array &model_arrays = output_models.surfaces[0].arrays;
+		const PackedVector3Array mverts = model_arrays[Mesh::ARRAY_VERTEX];
+		const PackedFloat32Array mcustom0 = model_arrays[Mesh::ARRAY_CUSTOM0];
+		ZN_TEST_ASSERT(mverts.size() > 0);
+		ZN_TEST_ASSERT(mcustom0.size() == mverts.size() * 4);
+	}
+
+	// The default LOD material must be a valid ShaderMaterial with a shader assigned: the
+	// terrain uses it as the material_override that culls Transvoxel transition meshes.
+	{
+		Ref<VoxelMesherHybrid> mesher_mat;
+		mesher_mat.instantiate();
+		Ref<ShaderMaterial> lod_material = mesher_mat->get_default_lod_material();
+		ZN_TEST_ASSERT(lod_material.is_valid());
+		ZN_TEST_ASSERT(lod_material->get_shader().is_valid());
 	}
 }
 
