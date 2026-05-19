@@ -3,6 +3,8 @@
 
 #include "../../util/godot/classes/material.h"
 #include "../../util/godot/classes/mesh.h"
+#include "../../util/godot/core/color.h"
+#include "../../util/godot/core/packed_arrays.h"
 #include "../voxel_mesher.h"
 #include "../blocky/voxel_blocky_library_base.h"
 #include "../transvoxel/voxel_mesher_transvoxel.h"
@@ -42,6 +44,13 @@ public:
 	Ref<Material> get_material_by_index(unsigned int index) const override;
 	unsigned int get_material_index_count() const override;
 
+	// Default material applied by the terrain as a single material_override over the whole
+	// chunk mesh. It is a ShaderMaterial whose shader both handles Transvoxel LOD transitions
+	// (so transition triangles are correctly culled instead of showing as artifacts) and picks
+	// a per-vertex colour from the CUSTOM1 material id. Without this, the terrain would get no
+	// LOD shader and the transition meshes would stay visible.
+	Ref<ShaderMaterial> get_default_lod_material() const override;
+
 	// Library of models used for the blocky (TYPE channel) part of the mesh.
 	void set_library(Ref<VoxelBlockyLibraryBase> library);
 	Ref<VoxelBlockyLibraryBase> get_library() const;
@@ -54,6 +63,16 @@ public:
 	// (a library slot may be null to mean "the default material").
 	void set_model_material(Ref<Material> material);
 	Ref<Material> get_model_material() const;
+
+	// Colours used by the default LOD shader (get_default_lod_material). The shader picks a
+	// colour per vertex from the CUSTOM1 material id: id 0 -> terrain_color, id N>=1 ->
+	// model_colors[N-1]. These are independent of terrain_material/model_material, which only
+	// apply when the terrain is rendered without the default LOD shader.
+	void set_terrain_color(Color color);
+	Color get_terrain_color() const;
+
+	void set_model_colors(PackedColorArray colors);
+	PackedColorArray get_model_colors() const;
 
 	// When enabled, the smooth terrain is flattened to the bottom edge of any voxel that
 	// holds a model, so models sit flush on the ground instead of floating or sinking.
@@ -70,9 +89,16 @@ private:
 	// into explicit collision_surface arrays, so model triangles can be appended afterwards.
 	void promote_terrain_collision(VoxelMesher::Output &output) const;
 
+	// Adds the CUSTOM1 material-id stream to the Transvoxel surface(s) and declares CUSTOM1 in
+	// output.mesh_flags, so the terrain surface has the same vertex format as the model surfaces.
+	void finalize_terrain_surfaces(VoxelMesher::Output &output) const;
+
 	// Returns true if any model voxel exists, and writes a flattened SDF copy into `dst`.
 	// `dst` is the SDF the smooth surface should be meshed from instead of the original.
 	bool build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher::Input &input) const;
+
+	// Pushes terrain_color / model_colors into the LOD shader material's u_material_colors.
+	void update_lod_material_colors() const;
 
 	static void _bind_methods();
 
@@ -83,6 +109,14 @@ private:
 
 	Ref<Material> _terrain_material;
 	Ref<Material> _model_material;
+
+	// Colours fed into the default LOD shader (see set_terrain_color / set_model_colors).
+	Color _terrain_color = Color(0.36f, 0.62f, 0.30f);
+	PackedColorArray _model_colors;
+
+	// The default LOD material, created once in the constructor (the terrain may request it
+	// through a const reference). Colours are refreshed into it when they change.
+	Ref<ShaderMaterial> _default_lod_material;
 
 	bool _flatten_terrain_under_models = true;
 };

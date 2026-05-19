@@ -1,8 +1,12 @@
 #include "voxel_mesher_hybrid.h"
 #include "../../constants/cube_tables.h"
+#include "../../shaders/voxel_mesher_hybrid_shader.h"
 #include "../../storage/voxel_buffer.h"
 #include "../../util/containers/std_unordered_map.h"
 #include "../../util/containers/std_vector.h"
+#include "../../util/godot/classes/rendering_server.h"
+#include "../../util/godot/classes/shader.h"
+#include "../../util/godot/classes/shader_material.h"
 #include "../../util/godot/core/packed_arrays.h"
 #include "../../util/math/conv.h"
 #include "../../util/math/funcs.h"
@@ -74,6 +78,56 @@ void append_to_collision_surface(VoxelMesher::Output::CollisionSurface &col, con
 	}
 }
 
+// All surfaces of the hybrid mesh share one vertex format so the terrain can render them with a
+// single material_override (the default LOD shader). Two custom vertex streams are used:
+//   CUSTOM0 (4x float): Transvoxel LOD attributes -- secondary position + packed border masks.
+//                       The shader needs it on surface 0 for the transition cull; model surfaces
+//                       carry an inert value (secondary == primary, all masks 0, transition 0)
+//                       so the same shader leaves them untouched.
+//   CUSTOM1 (1x float): per-vertex material id. 0 = smooth terrain, 1.. = model materials.
+constexpr int CUSTOM0_FLOATS_PER_VERTEX = 4;
+constexpr int CUSTOM1_FLOATS_PER_VERTEX = 1;
+
+// The mesh_flags bits declaring the format of the two custom streams. build_mesh() applies one
+// flags value to every surface, and every hybrid surface carries both CUSTOM0 and CUSTOM1, so
+// both format fields must always be declared.
+//
+// Both fields are declared unconditionally: the inner Transvoxel mesher sets the CUSTOM0 field
+// itself, but only when it actually produced a surface -- a chunk that has models but no smooth
+// terrain leaves mesh_flags at 0. Were CUSTOM0 left undeclared, Godot would read its format as 0
+// (ARRAY_CUSTOM_RGBA8_UNORM), which expects a PackedByteArray and rejects the PackedFloat32Array
+// the model surface supplies ("Invalid array format for surface").
+constexpr int HYBRID_CUSTOM_MESH_FLAGS =
+		(RenderingServerEnums::ARRAY_CUSTOM_RGBA_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM0_SHIFT) |
+		(RenderingServerEnums::ARRAY_CUSTOM_R_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM1_SHIFT);
+
+// Builds the inert CUSTOM0 stream for a model surface: secondary position equals the primary
+// position and every packed mask byte is 0, so the LOD shader neither moves nor culls these
+// vertices (models are not transition geometry and do not shift between LOD levels).
+PackedFloat32Array build_model_custom0(const StdVector<Vector3f> &positions) {
+	PackedFloat32Array custom0;
+	custom0.resize(static_cast<int64_t>(positions.size()) * CUSTOM0_FLOATS_PER_VERTEX);
+	float *w = custom0.ptrw();
+	for (const Vector3f &p : positions) {
+		*w++ = p.x; // secondary_position.x
+		*w++ = p.y; // secondary_position.y
+		*w++ = p.z; // secondary_position.z
+		*w++ = 0.0f; // packed masks (cell/vertex border, transition) all zero
+	}
+	return custom0;
+}
+
+// Builds the CUSTOM1 stream (one material id repeated for every vertex of a surface).
+PackedFloat32Array build_custom1_material_id(int vertex_count, float material_id) {
+	PackedFloat32Array custom1;
+	custom1.resize(static_cast<int64_t>(vertex_count) * CUSTOM1_FLOATS_PER_VERTEX);
+	float *w = custom1.ptrw();
+	for (int i = 0; i < vertex_count; ++i) {
+		*w++ = material_id;
+	}
+	return custom1;
+}
+
 } // namespace
 
 VoxelMesherHybrid::VoxelMesherHybrid() {
@@ -81,6 +135,17 @@ VoxelMesherHybrid::VoxelMesherHybrid() {
 	// Padding is dictated by the smooth part. The blocky model part needs no neighbor padding
 	// (each model is self-contained within its voxel), so the Transvoxel requirements cover it.
 	set_padding(_transvoxel_mesher->get_minimum_padding(), _transvoxel_mesher->get_maximum_padding());
+
+	// Create the default LOD material once. The terrain may request it through a const
+	// reference (get_default_lod_material), so it cannot be lazily created there.
+	{
+		Ref<Shader> shader;
+		shader.instantiate();
+		shader->set_code(g_voxel_mesher_hybrid_shader);
+		_default_lod_material.instantiate();
+		_default_lod_material->set_shader(shader);
+	}
+	update_lod_material_colors();
 }
 
 VoxelMesherHybrid::~VoxelMesherHybrid() {}
@@ -141,6 +206,46 @@ Ref<Material> VoxelMesherHybrid::get_model_material() const {
 	return _model_material;
 }
 
+void VoxelMesherHybrid::set_terrain_color(Color color) {
+	_terrain_color = color;
+	update_lod_material_colors();
+}
+
+Color VoxelMesherHybrid::get_terrain_color() const {
+	return _terrain_color;
+}
+
+void VoxelMesherHybrid::set_model_colors(PackedColorArray colors) {
+	_model_colors = colors;
+	update_lod_material_colors();
+}
+
+PackedColorArray VoxelMesherHybrid::get_model_colors() const {
+	return _model_colors;
+}
+
+Ref<ShaderMaterial> VoxelMesherHybrid::get_default_lod_material() const {
+	return _default_lod_material;
+}
+
+void VoxelMesherHybrid::update_lod_material_colors() const {
+	if (_default_lod_material.is_null()) {
+		return;
+	}
+	// u_material_colors is a fixed-size shader array (MATERIAL_COLOR_COUNT == 8).
+	// Index 0 is the smooth terrain; indices 1.. are the model colors. The shader clamps the
+	// per-vertex id into range, so providing fewer colors than slots is safe.
+	constexpr int MATERIAL_COLOR_COUNT = 8;
+	Array colors;
+	colors.resize(MATERIAL_COLOR_COUNT);
+	colors[0] = _terrain_color;
+	for (int i = 1; i < MATERIAL_COLOR_COUNT; ++i) {
+		const int model_index = i - 1;
+		colors[i] = model_index < _model_colors.size() ? _model_colors[model_index] : Color(1, 1, 1);
+	}
+	_default_lod_material->set_shader_parameter("u_material_colors", colors);
+}
+
 void VoxelMesherHybrid::set_library(Ref<VoxelBlockyLibraryBase> library) {
 	_library = library;
 }
@@ -192,25 +297,40 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 	// and leaves ridges). `column_flatten_y` records, per column, the highest model bottom that
 	// claims it as a corner: if several models of different heights share a column, the highest
 	// keeps every model flush (lower ones embed slightly instead of floating).
+	//
+	// A column may only be claimed by a TYPE voxel that build_model_surface() actually turns
+	// into a rendered cube. The exact same validity test is used here -- not present in the
+	// library, or baked as empty -> no geometry, so flattening it would cut an axis-aligned
+	// step into the terrain with no model resting on it (a visible floating-triangle artifact).
 	StdVector<int> column_flatten_y;
 	column_flatten_y.resize(sx * sz, -1);
 	bool any_model = false;
-	for (int z = 0; z < sz; ++z) {
-		for (int x = 0; x < sx; ++x) {
-			for (int y = 0; y < block_size.y; ++y) {
-				if (src.get_voxel(Vector3i(x, y, z), type_channel) == blocky::AIR_ID) {
-					continue;
-				}
-				any_model = true;
-				// This model voxel claims its 4 bottom-face corner columns at height y.
-				for (int cz = z; cz <= z + 1; ++cz) {
-					for (int cx = x; cx <= x + 1; ++cx) {
-						if (cx < 0 || cx >= sx || cz < 0 || cz >= sz) {
-							continue;
-						}
-						int &slot = column_flatten_y[cx + cz * sx];
-						if (y > slot) {
-							slot = y;
+	{
+		// Baked data is the only library data safe for multithreaded access.
+		RWLockRead lock(_library->get_baked_data_rw_lock());
+		const blocky::BakedLibrary &baked = _library->get_baked_data();
+
+		for (int z = 0; z < sz; ++z) {
+			for (int x = 0; x < sx; ++x) {
+				for (int y = 0; y < block_size.y; ++y) {
+					const uint64_t voxel_id = src.get_voxel(Vector3i(x, y, z), type_channel);
+					if (voxel_id == blocky::AIR_ID || !baked.has_model(voxel_id)) {
+						continue;
+					}
+					if (baked.models[voxel_id].empty) {
+						continue;
+					}
+					any_model = true;
+					// This model voxel claims its 4 bottom-face corner columns at height y.
+					for (int cz = z; cz <= z + 1; ++cz) {
+						for (int cx = x; cx <= x + 1; ++cx) {
+							if (cx < 0 || cx >= sx || cz < 0 || cz >= sz) {
+								continue;
+							}
+							int &slot = column_flatten_y[cx + cz * sx];
+							if (y > slot) {
+								slot = y;
+							}
 						}
 					}
 				}
@@ -288,6 +408,10 @@ void VoxelMesherHybrid::build(VoxelMesher::Output &output, const VoxelMesher::In
 		_transvoxel_mesher->build(output, input);
 	}
 
+	// Give the Transvoxel surface(s) the CUSTOM1 material-id stream so every surface of the
+	// final mesh shares one vertex format (model surfaces get CUSTOM1 in build_model_surface).
+	finalize_terrain_surfaces(output);
+
 	// Convert the Transvoxel terrain collision (a submesh range of surface 0) into explicit
 	// collision_surface arrays, so the model triangles can be appended to the same collider.
 	promote_terrain_collision(output);
@@ -295,6 +419,34 @@ void VoxelMesherHybrid::build(VoxelMesher::Output &output, const VoxelMesher::In
 	// Surface 1: sharp-edged 3D models baked from the TYPE channel.
 	// Also appends the model triangles to output.collision_surface.
 	build_model_surface(output, input);
+}
+
+void VoxelMesherHybrid::finalize_terrain_surfaces(VoxelMesher::Output &output) const {
+	ZN_PROFILE_SCOPE();
+
+	// All surfaces that exist at this point were produced by the inner Transvoxel mesher
+	// (model surfaces are appended later). Transvoxel already provides CUSTOM0; the hybrid
+	// mesher additionally needs CUSTOM1 (material id) on every surface, so the terrain renders
+	// with the same vertex format -- and the same single material_override -- as the models.
+	for (VoxelMesher::Output::Surface &surface : output.surfaces) {
+		Array &arrays = surface.arrays;
+		if (arrays.size() < Mesh::ARRAY_MAX) {
+			continue;
+		}
+		const PackedVector3Array vertices = arrays[Mesh::ARRAY_VERTEX];
+		if (vertices.size() == 0) {
+			continue;
+		}
+		// Material id 0 is the smooth terrain (see get_material_by_index / the LOD shader).
+		arrays[Mesh::ARRAY_CUSTOM1] = build_custom1_material_id(vertices.size(), 0.0f);
+	}
+
+	// Declare the format of both custom streams. build_mesh() applies these flags to every
+	// surface, and every surface -- terrain and models -- carries both CUSTOM0 and CUSTOM1.
+	// Both fields are set unconditionally rather than relying on Transvoxel having set CUSTOM0:
+	// a chunk with models but no smooth terrain leaves Transvoxel's mesh_flags at 0, and an
+	// undeclared CUSTOM0 field would make Godot reject the model surface (see HYBRID_CUSTOM_MESH_FLAGS).
+	output.mesh_flags |= HYBRID_CUSTOM_MESH_FLAGS;
 }
 
 void VoxelMesherHybrid::promote_terrain_collision(VoxelMesher::Output &output) const {
@@ -458,14 +610,24 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 		copy_to(gd_uvs, to_span_const(sa.uvs));
 		copy_to(gd_indices, to_span_const(sa.indices));
 
+		// Surface material index: index 0 is reserved for the smooth terrain, so model
+		// material id N maps to surface material index 1 + N (see get_material_by_index).
+		const uint16_t surface_material_index = static_cast<uint16_t>(1 + material_id);
+
+		// CUSTOM0/CUSTOM1 give the model surface the same vertex format as the smooth
+		// surface, so one material_override (the default LOD shader) renders them all.
+		// CUSTOM1 carries the material id the shader uses to pick a colour.
 		Array arrays;
 		arrays.resize(Mesh::ARRAY_MAX);
 		arrays[Mesh::ARRAY_VERTEX] = gd_positions;
 		arrays[Mesh::ARRAY_NORMAL] = gd_normals;
 		arrays[Mesh::ARRAY_TEX_UV] = gd_uvs;
 		arrays[Mesh::ARRAY_INDEX] = gd_indices;
+		arrays[Mesh::ARRAY_CUSTOM0] = build_model_custom0(sa.positions);
+		arrays[Mesh::ARRAY_CUSTOM1] =
+				build_custom1_material_id(gd_positions.size(), static_cast<float>(surface_material_index));
 
-		output.surfaces.push_back({ arrays, static_cast<uint16_t>(1 + material_id) });
+		output.surfaces.push_back({ arrays, surface_material_index });
 
 		// Append the same model geometry to the collision surface so models are solid.
 		// promote_terrain_collision() has already placed the terrain geometry there.
@@ -484,6 +646,12 @@ void VoxelMesherHybrid::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_model_material", "material"), &Self::set_model_material);
 	ClassDB::bind_method(D_METHOD("get_model_material"), &Self::get_model_material);
+
+	ClassDB::bind_method(D_METHOD("set_terrain_color", "color"), &Self::set_terrain_color);
+	ClassDB::bind_method(D_METHOD("get_terrain_color"), &Self::get_terrain_color);
+
+	ClassDB::bind_method(D_METHOD("set_model_colors", "colors"), &Self::set_model_colors);
+	ClassDB::bind_method(D_METHOD("get_model_colors"), &Self::get_model_colors);
 
 	ClassDB::bind_method(
 			D_METHOD("set_flatten_terrain_under_models", "enabled"), &Self::set_flatten_terrain_under_models
@@ -515,6 +683,16 @@ void VoxelMesherHybrid::_bind_methods() {
 			),
 			"set_model_material",
 			"get_model_material"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::COLOR, "terrain_color"),
+			"set_terrain_color",
+			"get_terrain_color"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(Variant::PACKED_COLOR_ARRAY, "model_colors"),
+			"set_model_colors",
+			"get_model_colors"
 	);
 	ADD_PROPERTY(
 			PropertyInfo(Variant::BOOL, "flatten_terrain_under_models"),
