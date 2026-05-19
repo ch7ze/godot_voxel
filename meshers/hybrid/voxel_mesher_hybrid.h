@@ -89,8 +89,9 @@ private:
 	// into explicit collision_surface arrays, so model triangles can be appended afterwards.
 	void promote_terrain_collision(VoxelMesher::Output &output) const;
 
-	// Adds the CUSTOM1 material-id stream to the Transvoxel surface(s) and declares CUSTOM1 in
-	// output.mesh_flags, so the terrain surface has the same vertex format as the model surfaces.
+	// Adds the CUSTOM1 material-id stream to the Transvoxel surface(s) and declares both custom
+	// vertex stream formats (CUSTOM0 and CUSTOM1) in output.mesh_flags, so every surface --
+	// terrain and models -- ends up with the same vertex format.
 	void finalize_terrain_surfaces(VoxelMesher::Output &output) const;
 
 	// Returns true if any model voxel exists, and writes a flattened SDF copy into `dst`.
