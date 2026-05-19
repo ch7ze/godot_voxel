@@ -36,7 +36,8 @@ public:
 
 	bool is_generating_collision_surface() const override;
 
-	// Provides the material for each surface: index 0 = smooth terrain, index 1 = models.
+	// Provides the material for each surface index. Index 0 is the smooth terrain;
+	// indices >= 1 map to the model library's materials (index 1 -> library material 0, etc.).
 	// The terrain calls this per chunk surface to assign materials.
 	Ref<Material> get_material_by_index(unsigned int index) const override;
 	unsigned int get_material_index_count() const override;
@@ -49,7 +50,8 @@ public:
 	void set_terrain_material(Ref<Material> material);
 	Ref<Material> get_terrain_material() const;
 
-	// Material for the blocky model surface (surface 1).
+	// Fallback material for model surfaces whose library material slot is null
+	// (a library slot may be null to mean "the default material").
 	void set_model_material(Ref<Material> material);
 	Ref<Material> get_model_material() const;
 

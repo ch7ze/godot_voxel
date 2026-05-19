@@ -1,6 +1,7 @@
 #include "voxel_mesher_hybrid.h"
 #include "../../constants/cube_tables.h"
 #include "../../storage/voxel_buffer.h"
+#include "../../util/containers/std_unordered_map.h"
 #include "../../util/containers/std_vector.h"
 #include "../../util/godot/core/packed_arrays.h"
 #include "../../util/profiling.h"
@@ -16,11 +17,8 @@ namespace {
 // Kept as a local constant so this file does not need to pull in the whole blocky mesher header.
 static constexpr int MODEL_PADDING = 1;
 
-// Accumulates triangles of all baked models found in the TYPE channel into plain arrays.
-// Each model's geometry is translated to its voxel position. No neighbor-culling is done:
-// every side surface is baked, even if occluded. That keeps this step simple and correct;
-// culling is an optimization that can be added later.
-struct ModelMeshAccumulator {
+// Plain geometry arrays for one mesh surface.
+struct SurfaceArrays {
 	StdVector<Vector3f> positions;
 	StdVector<Vector3f> normals;
 	StdVector<Vector2f> uvs;
@@ -50,6 +48,16 @@ struct ModelMeshAccumulator {
 	}
 };
 
+// Accumulates baked model geometry from the TYPE channel, grouped by material id so each
+// material can become its own mesh surface. No neighbor-culling is done: every side surface
+// is baked, even if occluded -- that keeps this step simple and correct; culling is an
+// optimization that can be added later.
+//
+// blocky::generate_mesh (VoxelMesherBlocky) does similar batching but is a file-local
+// template, not exported in any header, and also does culling/AO/tint/collision that this
+// mesher does not need -- so it cannot be reused as-is and this reduced version is kept here.
+using ModelMeshAccumulator = StdUnorderedMap<uint32_t, SurfaceArrays>;
+
 } // namespace
 
 VoxelMesherHybrid::VoxelMesherHybrid() {
@@ -73,18 +81,29 @@ bool VoxelMesherHybrid::is_generating_collision_surface() const {
 }
 
 Ref<Material> VoxelMesherHybrid::get_material_by_index(unsigned int index) const {
-	// Surface 0 = smooth terrain, surface 1 = blocky models.
+	// Index 0 is the smooth terrain surface.
 	if (index == 0) {
 		return _terrain_material;
 	}
-	if (index == 1) {
-		return _model_material;
+	// Indices >= 1 map to the model library's materials (index 1 -> library material 0).
+	if (_library.is_valid()) {
+		const Ref<Material> lib_material = _library->get_material_by_index(index - 1);
+		// A library material slot may be null ("the default material"): fall back to
+		// the configurable model material so such models still get something to render.
+		if (lib_material.is_valid()) {
+			return lib_material;
+		}
 	}
-	return Ref<Material>();
+	return _model_material;
 }
 
 unsigned int VoxelMesherHybrid::get_material_index_count() const {
-	return 2;
+	// 1 for the terrain surface, plus one slot per library material.
+	unsigned int count = 1;
+	if (_library.is_valid()) {
+		count += _library->get_material_index_count();
+	}
+	return count;
 }
 
 void VoxelMesherHybrid::set_terrain_material(Ref<Material> material) {
@@ -303,15 +322,17 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 					const Vector3f voxel_offset(x - min.x, y - min.y, z - min.z);
 
 					for (unsigned int s = 0; s < model.surface_count; ++s) {
-						// Inner geometry of the model.
+						// Inner geometry of the model. Each model surface has its own material
+						// id; geometry is grouped by that id so it becomes its own mesh surface.
 						const blocky::BakedModel::Surface &surface = model.surfaces[s];
-						acc.append_geometry(
+						acc[surface.material_id].append_geometry(
 								surface.positions, surface.normals, surface.uvs, surface.indices, voxel_offset
 						);
-						// All 6 cube sides (not culled against neighbors in this step).
+						// All 6 cube sides (not culled against neighbors in this step). Side
+						// surfaces share the material id of their parent model surface.
 						for (unsigned int side = 0; side < Cube::SIDE_COUNT; ++side) {
 							const blocky::BakedModel::SideSurface &side_surface = model.sides_surfaces[side][s];
-							acc.append_geometry(
+							acc[surface.material_id].append_geometry(
 									side_surface.positions,
 									StdVector<Vector3f>(),
 									side_surface.uvs,
@@ -325,37 +346,43 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 		}
 	}
 
-	if (acc.indices.size() == 0) {
-		return;
-	}
+	const float lod_scale = (input.lod_index > 0) ? static_cast<float>(1 << input.lod_index) : 1.0f;
 
-	// Apply LOD scaling, same approach as VoxelMesherBlocky: positions are scaled up so a
-	// model occupies the larger world-space of a coarse-LOD voxel.
-	if (input.lod_index > 0) {
-		const float lod_scale = static_cast<float>(1 << input.lod_index);
-		for (Vector3f &p : acc.positions) {
-			p = p * lod_scale;
+	// Emit one mesh surface per material id. Surface material index is `1 + material_id`,
+	// because index 0 is reserved for the smooth terrain surface (see get_material_by_index).
+	for (auto &entry : acc) {
+		const uint32_t material_id = entry.first;
+		SurfaceArrays &sa = entry.second;
+		if (sa.indices.size() == 0) {
+			continue;
 		}
+
+		// Apply LOD scaling, same approach as VoxelMesherBlocky: positions are scaled up so a
+		// model occupies the larger world-space of a coarse-LOD voxel.
+		if (lod_scale != 1.0f) {
+			for (Vector3f &p : sa.positions) {
+				p = p * lod_scale;
+			}
+		}
+
+		PackedVector3Array gd_positions;
+		PackedVector3Array gd_normals;
+		PackedVector2Array gd_uvs;
+		PackedInt32Array gd_indices;
+		copy_to(gd_positions, to_span_const(sa.positions));
+		copy_to(gd_normals, to_span_const(sa.normals));
+		copy_to(gd_uvs, to_span_const(sa.uvs));
+		copy_to(gd_indices, to_span_const(sa.indices));
+
+		Array arrays;
+		arrays.resize(Mesh::ARRAY_MAX);
+		arrays[Mesh::ARRAY_VERTEX] = gd_positions;
+		arrays[Mesh::ARRAY_NORMAL] = gd_normals;
+		arrays[Mesh::ARRAY_TEX_UV] = gd_uvs;
+		arrays[Mesh::ARRAY_INDEX] = gd_indices;
+
+		output.surfaces.push_back({ arrays, static_cast<uint16_t>(1 + material_id) });
 	}
-
-	PackedVector3Array gd_positions;
-	PackedVector3Array gd_normals;
-	PackedVector2Array gd_uvs;
-	PackedInt32Array gd_indices;
-	copy_to(gd_positions, to_span_const(acc.positions));
-	copy_to(gd_normals, to_span_const(acc.normals));
-	copy_to(gd_uvs, to_span_const(acc.uvs));
-	copy_to(gd_indices, to_span_const(acc.indices));
-
-	Array arrays;
-	arrays.resize(Mesh::ARRAY_MAX);
-	arrays[Mesh::ARRAY_VERTEX] = gd_positions;
-	arrays[Mesh::ARRAY_NORMAL] = gd_normals;
-	arrays[Mesh::ARRAY_TEX_UV] = gd_uvs;
-	arrays[Mesh::ARRAY_INDEX] = gd_indices;
-
-	// Material index 1: distinct from the smooth surface (index 0) so each gets its own material.
-	output.surfaces.push_back({ arrays, 1 });
 }
 
 void VoxelMesherHybrid::_bind_methods() {

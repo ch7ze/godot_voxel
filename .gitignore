@@ -19,5 +19,6 @@ shaders/dev/.godot/
 *.gen.glsl
 *.gen.h
 *.gen.cpp
-*.so
+# Build output of the GDExtension. Scoped to the bin folder on purpose:
+# a global `*.so` would also hide thirdparty or prebuilt libraries elsewhere.
 project/addons/zylann.voxel/bin/
