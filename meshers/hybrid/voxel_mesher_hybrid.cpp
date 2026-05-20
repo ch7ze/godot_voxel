@@ -291,17 +291,25 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 	// Transvoxel meshes the surface under that face from the cell at (mx, my-1, mz), whose
 	// four UPPER corners are the columns (mx,mz), (mx+1,mz), (mx,mz+1), (mx+1,mz+1).
 	//
-	// So to make a model sit flush on all four of its bottom edges, all FOUR of those corner
+	// To make a model sit flush on all four of its bottom edges, all FOUR of those corner
 	// columns must be flattened to `my` -- not just the model's own column (which would tilt
 	// the surface toward one corner), and not the whole 3x3 neighborhood (which lifts a plateau
-	// and leaves ridges). `column_flatten_y` records, per column, the highest model bottom that
-	// claims it as a corner: if several models of different heights share a column, the highest
-	// keeps every model flush (lower ones embed slightly instead of floating).
+	// and leaves ridges).
 	//
-	// A column may only be claimed by a TYPE voxel that build_model_surface() actually turns
-	// into a rendered cube. The exact same validity test is used here -- not present in the
-	// library, or baked as empty -> no geometry, so flattening it would cut an axis-aligned
-	// step into the terrain with no model resting on it (a visible floating-triangle artifact).
+	// Only STACK BASES (model voxels with no model voxel directly below) trigger flattening:
+	// the terrain only needs to meet the bottom of a stack; the higher voxels of the same stack
+	// are supported by the lower ones, not by the ground. If every model voxel in a stack
+	// claimed its own height, several blocks stacked over one cell would pull the ground up to
+	// the topmost block and produce a visible cone of ground under the stack.
+	//
+	// `column_flatten_y` records, per column, the LOWEST stack-base height that claims it as a
+	// corner. If two separate stacks (e.g. a floating block above a ground block) share a column,
+	// the lower base wins -- it is the one that needs ground contact, the upper one floats.
+	//
+	// A model voxel only counts here if build_model_surface() would actually render it. The
+	// same validity test is used (in library, not empty): a TYPE value that does not produce
+	// geometry must not flatten the terrain either, otherwise the ground gets an axis-aligned
+	// step with no model resting on it (a visible floating-triangle artifact).
 	StdVector<int> column_flatten_y;
 	column_flatten_y.resize(sx * sz, -1);
 	bool any_model = false;
@@ -310,25 +318,60 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 		RWLockRead lock(_library->get_baked_data_rw_lock());
 		const blocky::BakedLibrary &baked = _library->get_baked_data();
 
+		auto is_rendered_model = [&baked](uint64_t voxel_id) -> bool {
+			if (voxel_id == blocky::AIR_ID || !baked.has_model(voxel_id)) {
+				return false;
+			}
+			return !baked.models[voxel_id].empty;
+		};
+
 		for (int z = 0; z < sz; ++z) {
 			for (int x = 0; x < sx; ++x) {
 				for (int y = 0; y < block_size.y; ++y) {
 					const uint64_t voxel_id = src.get_voxel(Vector3i(x, y, z), type_channel);
-					if (voxel_id == blocky::AIR_ID || !baked.has_model(voxel_id)) {
-						continue;
-					}
-					if (baked.models[voxel_id].empty) {
+					if (!is_rendered_model(voxel_id)) {
 						continue;
 					}
 					any_model = true;
-					// This model voxel claims its 4 bottom-face corner columns at height y.
+					// Stack-base test: only the lowest voxel of a stacked column triggers
+					// flattening. If `y == 0` we are at the bottom of the buffer (including its
+					// padding border); we conservatively treat that as a base. If the stack
+					// actually continues into the neighbour chunk below, that chunk owns the
+					// real base position and will flatten there.
+					const bool below_is_model =
+							y > 0 && is_rendered_model(src.get_voxel(Vector3i(x, y - 1, z), type_channel));
+					if (below_is_model) {
+						continue;
+					}
+					// Ground-proximity test: only the voxel DIRECTLY under the model voxel
+					// (`(x, y - 1, z)`) counts as ground. Neighbour columns do not count -- a
+					// block standing on a cliff edge gets no flattening just because the cliff
+					// is next to it; only blocks resting directly on a solid sample below them
+					// trigger flattening.
+					//
+					// If the test is positive, ALL FOUR corner columns are claimed (the bottom
+					// face is a quad and Transvoxel meshes it from 4 corner samples; claiming
+					// fewer than 4 would tilt the cell and leave gaps to the block bottom).
+					// If the test is negative, NO corner column is claimed -- the block floats.
+					//
+					// If `y == 0` we can't read `y - 1` and treat as "no ground". The neighbour
+					// chunk below owns the real proximity decision if the base actually continues
+					// into it.
+					if (y == 0) {
+						continue;
+					}
+					// SDF convention: negative = solid (matches Pass 2 below and the generators
+					// that write sdf = world_y - height).
+					if (src.get_voxel_f(Vector3i(x, y - 1, z), sdf_channel) >= 0.0f) {
+						continue;
+					}
 					for (int cz = z; cz <= z + 1; ++cz) {
 						for (int cx = x; cx <= x + 1; ++cx) {
 							if (cx < 0 || cx >= sx || cz < 0 || cz >= sz) {
 								continue;
 							}
 							int &slot = column_flatten_y[cx + cz * sx];
-							if (y > slot) {
+							if (slot < 0 || y < slot) {
 								slot = y;
 							}
 						}
