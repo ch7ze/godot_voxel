@@ -1,6 +1,8 @@
 #include "raycast.h"
+#include "../meshers/blocky/blocky_baked_library.h"
 #include "../meshers/blocky/voxel_mesher_blocky.h"
 #include "../meshers/cubes/voxel_mesher_cubes.h"
+#include "../meshers/hybrid/voxel_mesher_hybrid.h"
 #include "../storage/voxel_buffer.h"
 #include "../storage/voxel_data.h"
 #include "../terrain/voxel_node.h"
@@ -384,6 +386,148 @@ Ref<VoxelRaycastResult> raycast_nonzero(
 	return res;
 }
 
+Ref<VoxelRaycastResult> raycast_hybrid(
+		const VoxelData &voxel_data,
+		const VoxelMesherHybrid &mesher,
+		const Vector3 ray_origin,
+		const Vector3 ray_dir,
+		const float max_distance
+) {
+	// The hybrid mesher renders two kinds of surfaces in one chunk -- smooth SDF terrain and
+	// blocky TYPE-channel cubes -- and the raycast has to handle both:
+	//
+	//  - SDF surfaces are polygonized with Marching Cubes, whose iso-surface sits between the
+	//    voxel sample points (centered around the lower corner of an 8-sample cell). Running
+	//    the DDA with a +0.5 ray origin offset makes the cells line up with what the player
+	//    sees, so previous_position is the empty cell ABOVE the visible ground -- the right
+	//    cell to place a new block in. This is the same trick raycast_sdf uses.
+	//
+	//  - TYPE voxels fill their own integer cell [x..x+1, y..y+1, z..z+1] exactly. The DDA
+	//    must run on the unshifted ray for this case; a +0.5 offset would shift hits by one
+	//    cell and stacking blocks would land off by one.
+	//
+	// Running ONE DDA with a single offset compromises one of the two cases. So this function
+	// runs two DDAs (TYPE and SDF) and picks whichever hit is closer along the ray.
+	//
+	// The library may be null (hybrid without models). In that case only the SDF leg runs --
+	// the same code path plain Transvoxel takes.
+
+	Ref<VoxelBlockyLibraryBase> library_ref = mesher.get_library();
+	const blocky::BakedLibrary *baked = nullptr;
+	if (library_ref.is_valid()) {
+		baked = &library_ref->get_baked_data();
+	}
+
+	// --- TYPE leg: DDA without offset, hit when a non-empty library model sits in the cell ---
+
+	struct RaycastPredicateType {
+		const VoxelData &data;
+		const blocky::BakedLibrary *baked;
+
+		bool operator()(const VoxelRaycastState &rs) const {
+			VoxelSingleValue type_def;
+			type_def.i = 0;
+			const uint64_t v = data.get_voxel(rs.hit_position, VoxelBuffer::CHANNEL_TYPE, type_def).i;
+			if (v == blocky::AIR_ID || !baked->has_model(v)) {
+				return false;
+			}
+			// Matches what VoxelMesherHybrid::build_model_surface renders.
+			return !baked->models[v].empty;
+		}
+	};
+
+	bool type_hit = false;
+	Vector3i type_hit_pos;
+	Vector3i type_prev_pos;
+	float type_hit_distance = 0.f;
+	float type_hit_distance_prev = 0.f;
+
+	if (baked != nullptr) {
+		RaycastPredicateType type_predicate{ voxel_data, baked };
+		type_hit = zylann::voxel_raycast(
+				ray_origin,
+				ray_dir,
+				type_predicate,
+				max_distance,
+				type_hit_pos,
+				type_prev_pos,
+				type_hit_distance,
+				type_hit_distance_prev
+		);
+	}
+
+	// --- SDF leg: DDA with +0.5 ray origin offset (matches raycast_sdf), hit when sdf < 0 ---
+
+	struct RaycastPredicateSdf {
+		const VoxelData &data;
+
+		bool operator()(const VoxelRaycastState &rs) const {
+			VoxelSingleValue sdf_def;
+			sdf_def.f = constants::SDF_FAR_OUTSIDE;
+			const VoxelSingleValue v = data.get_voxel(rs.hit_position, VoxelBuffer::CHANNEL_SDF, sdf_def);
+			return v.f < 0;
+		}
+	};
+
+	const Vector3 sdf_offset(0.5, 0.5, 0.5);
+	// A point reached at parametric t on the unshifted ray corresponds to t' = t - sdf_t_shift
+	// on the shifted ray. Inversely, an SDF DDA distance is converted back to the unshifted
+	// frame by adding sdf_t_shift. The sign of this shift depends on ray direction.
+	const float sdf_t_shift = sdf_offset.dot(ray_dir);
+
+	RaycastPredicateSdf sdf_predicate{ voxel_data };
+	Vector3i sdf_hit_pos;
+	Vector3i sdf_prev_pos;
+	float sdf_hit_distance_shifted = 0.f;
+	float sdf_hit_distance_prev_shifted = 0.f;
+	const bool sdf_hit = zylann::voxel_raycast(
+			ray_origin + sdf_offset,
+			ray_dir,
+			sdf_predicate,
+			max_distance,
+			sdf_hit_pos,
+			sdf_prev_pos,
+			sdf_hit_distance_shifted,
+			sdf_hit_distance_prev_shifted
+	);
+
+	// --- Pick the closer hit in the unshifted ray frame ---
+
+	if (!type_hit && !sdf_hit) {
+		return Ref<VoxelRaycastResult>();
+	}
+
+	// Default to whichever leg actually hit.
+	bool use_type = type_hit;
+	if (type_hit && sdf_hit) {
+		// SDF distance is measured from the shifted origin; convert to the unshifted frame
+		// so it can be compared with the TYPE distance.
+		const float sdf_distance_unshifted = sdf_hit_distance_shifted + sdf_t_shift;
+		// Tiebreaker: when distances are effectively equal, prefer TYPE -- its cell is exact,
+		// while the SDF hit is rounded to the nearest sample cell.
+		use_type = type_hit_distance <= sdf_distance_unshifted;
+	}
+
+	Ref<VoxelRaycastResult> res;
+	res.instantiate();
+	if (use_type) {
+		res->position = type_hit_pos;
+		res->previous_position = type_prev_pos;
+		res->distance_along_ray = type_hit_distance;
+		res->normal = to_vec3(type_hit_pos - type_prev_pos);
+	} else {
+		res->position = sdf_hit_pos;
+		res->previous_position = sdf_prev_pos;
+		res->distance_along_ray = sdf_hit_distance_shifted + sdf_t_shift;
+		// Axis-aligned normal from the cell step. The smooth SDF normal would be more accurate
+		// but the builder only uses previous_position, and the highlight reads it via the
+		// builder's get_placement_pos() result, not the normal.
+		res->normal = to_vec3(sdf_hit_pos - sdf_prev_pos);
+	}
+
+	return res;
+}
+
 Ref<VoxelRaycastResult> raycast_generic(
 		const VoxelData &voxel_data,
 		const Ref<VoxelMesher> mesher,
@@ -400,12 +544,18 @@ Ref<VoxelRaycastResult> raycast_generic(
 
 	Ref<VoxelMesherBlocky> mesher_blocky;
 	Ref<VoxelMesherCubes> mesher_cubes;
+	Ref<VoxelMesherHybrid> mesher_hybrid;
 
 	if (try_get_as(mesher, mesher_blocky)) {
 		res = raycast_blocky(voxel_data, **mesher_blocky, ray_origin, ray_dir, max_distance, p_collision_mask);
 
 	} else if (try_get_as(mesher, mesher_cubes)) {
 		res = raycast_nonzero(voxel_data, ray_origin, ray_dir, max_distance, VoxelBuffer::CHANNEL_COLOR);
+
+	} else if (try_get_as(mesher, mesher_hybrid)) {
+		// Hybrid surfaces combine SDF terrain and TYPE-channel model cubes. Both must be
+		// hittable, so placed cubes can be targeted for stacking.
+		res = raycast_hybrid(voxel_data, **mesher_hybrid, ray_origin, ray_dir, max_distance);
 
 	} else {
 		res = raycast_sdf(voxel_data, ray_origin, ray_dir, max_distance, binary_search_iterations, normal_enabled);

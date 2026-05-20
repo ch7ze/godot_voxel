@@ -10,6 +10,7 @@ namespace zylann::voxel {
 
 class VoxelData;
 class VoxelMesherBlocky;
+class VoxelMesherHybrid;
 
 Ref<VoxelRaycastResult> raycast_sdf(
 		const VoxelData &voxel_data,
@@ -27,6 +28,18 @@ Ref<VoxelRaycastResult> raycast_blocky(
 		const Vector3 ray_dir,
 		const float max_distance,
 		const uint32_t p_collision_mask
+);
+
+// Raycast for VoxelMesherHybrid: a voxel is a hit if either its SDF channel is solid
+// (sdf < 0) OR its TYPE channel holds a non-empty model from the library. The DDA stepping
+// stops at the first hit, so the closer surface wins. previous_position is always the empty
+// voxel right before the hit, which is the cell where a new block should be placed.
+Ref<VoxelRaycastResult> raycast_hybrid(
+		const VoxelData &voxel_data,
+		const VoxelMesherHybrid &mesher,
+		const Vector3 ray_origin,
+		const Vector3 ray_dir,
+		const float max_distance
 );
 
 Ref<VoxelRaycastResult> raycast_nonzero(
