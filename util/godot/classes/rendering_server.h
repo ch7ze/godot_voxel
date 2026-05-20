@@ -89,6 +89,11 @@ RenderThreadModel get_render_thread_model(const ProjectSettings &settings);
 // Tells if it is safe to call functions of the RenderingServer from a thread other than the main one.
 bool is_render_thread_model_safe(const RenderThreadModel mode);
 
+// Tells if Godot runs without a real display (the `headless` display driver, e.g. `--headless`).
+// In that mode the dummy RenderingServer is active, and building graphics resources from threads
+// other than the main one is not safe (the dummy resource storage is not thread-aware).
+bool is_headless_display_server();
+
 } // namespace zylann::godot
 
 #endif // ZN_GODOT_RENDERING_SERVER_H

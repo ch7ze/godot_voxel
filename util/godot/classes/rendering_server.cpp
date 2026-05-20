@@ -3,6 +3,7 @@
 #include "../../string/format.h"
 #include "../core/string.h"
 #include "../core/version.h"
+#include "display_server.h"
 #include "project_settings.h"
 
 namespace zylann::godot {
@@ -143,6 +144,17 @@ bool is_render_thread_model_safe(const RenderThreadModel mode) {
 			ZN_PRINT_ERROR("Unhandled enum value");
 			return false;
 	}
+}
+
+bool is_headless_display_server() {
+	DisplayServer *ds = DisplayServer::get_singleton();
+	if (ds == nullptr) {
+		// No DisplayServer at all: definitely no real renderer.
+		return true;
+	}
+	// Godot's headless display driver reports its name as "headless"
+	// (see Godot's DisplayServerHeadless::get_name()).
+	return ds->get_name() == "headless";
 }
 
 } // namespace zylann::godot

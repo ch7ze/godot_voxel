@@ -90,6 +90,14 @@ static bool auto_detect_threaded_graphics_resource_building_support() {
 	const ProjectSettings *project = ProjectSettings::get_singleton();
 	ZN_ASSERT_RETURN_V(project != nullptr, false);
 
+	// In headless mode the dummy RenderingServer is active. Its resource storage is not
+	// thread-aware, so building meshes from threads other than the main one produces
+	// intermittent "wrong RID" / null-mesh errors. The driver/method checks below don't
+	// catch this because Godot still reports the configured method and driver names.
+	if (zylann::godot::is_headless_display_server()) {
+		return false;
+	}
+
 	const zylann::godot::RenderThreadModel rendering_thread_model = zylann::godot::get_render_thread_model(*project);
 	const zylann::godot::RenderMethod rendering_method = zylann::godot::get_current_rendering_method();
 	const zylann::godot::RenderDriverName driver = zylann ::godot::get_current_rendering_driver();
