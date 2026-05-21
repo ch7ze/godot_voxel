@@ -395,13 +395,31 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 	//   - model on a slope   -> uphill ground stays higher and the model embeds into the slope.
 	// Columns outside the claimed corners are left untouched, so Transvoxel interpolates a
 	// smooth slope from the flattened square down to the surrounding terrain.
+	//
+	// Only the two y rows that actually shape the cell directly below the model are written:
+	//   - y = flatten_y       (top samples of that cell, clamped to <= 0 -> surface ends here),
+	//   - y = flatten_y - 1   (bottom samples of that cell, clamped to <= -1 -> guaranteed solid).
+	// Marching Cubes / Transvoxel polygonize a cell from its 8 corner samples only, so samples
+	// further down do not affect the surface at the model bottom. Writing the full column would
+	// also overwrite samples deep below the block on every remesh -- making any sdf edit (e.g.
+	// digging a tunnel under the block) invisible, because Pass 2 would re-clamp those cells to
+	// `plane < 0` (solid) at every build. Restricting Pass 2 to these two rows leaves the rest
+	// of the column on whatever the data stream has (generator or edits) and lets digging show
+	// through under a placed block, the same way it shows through anywhere else.
 	for (int z = 0; z < sz; ++z) {
 		for (int x = 0; x < sx; ++x) {
 			const int flatten_y = column_flatten_y[x + z * sx];
 			if (flatten_y < 0) {
 				continue;
 			}
-			for (int y = 0; y < block_size.y; ++y) {
+			// flatten_y - 1 can fall below 0 at chunk borders; skip those out-of-range writes.
+			// The neighbour chunk below owns the actual bottom row in that case.
+			const int y_lo = flatten_y - 1;
+			const int y_hi = flatten_y;
+			for (int y : { y_lo, y_hi }) {
+				if (y < 0 || y >= block_size.y) {
+					continue;
+				}
 				const Vector3i pos(x, y, z);
 				const float original = dst.get_voxel_f(pos, sdf_channel);
 				const float plane = static_cast<float>(y - flatten_y);
