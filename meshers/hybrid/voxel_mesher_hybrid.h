@@ -49,6 +49,11 @@ public:
 	// (so transition triangles are correctly culled instead of showing as artifacts) and picks
 	// a per-vertex colour from the CUSTOM1 material id. Without this, the terrain would get no
 	// LOD shader and the transition meshes would stay visible.
+	//
+	// The default shader is only meaningful when the inner Transvoxel mesher's texturing mode
+	// is TEXTURES_NONE: it reads the material id from CUSTOM1. With texturing enabled the
+	// material id lives in CUSTOM2 instead, so a project-specific user shader (assigned via
+	// VoxelLodTerrain.material) is required to render the surfaces correctly.
 	Ref<ShaderMaterial> get_default_lod_material() const override;
 
 	// Library of models used for the blocky (TYPE channel) part of the mesh.
@@ -79,6 +84,14 @@ public:
 	void set_flatten_terrain_under_models(bool enabled);
 	bool get_flatten_terrain_under_models() const;
 
+	// Texturing mode is forwarded to the inner Transvoxel mesher. With TEXTURES_MIXEL4_S4 or
+	// TEXTURES_SINGLE_S4, Transvoxel writes its 2-float texture data into CUSTOM1 of the
+	// smooth surface, and the hybrid mesher relocates its per-vertex material id to CUSTOM2
+	// so both data streams coexist. Models always store their material id in CUSTOM2 as well,
+	// keeping every surface in the chunk on a uniform vertex format.
+	void set_texturing_mode(VoxelMesherTransvoxel::TexturingMode mode);
+	VoxelMesherTransvoxel::TexturingMode get_texturing_mode() const;
+
 private:
 	// Builds the blocky model part into `output` (Surface 1, one surface per material).
 	// Also appends the model triangles to `output.collision_surface` so models are solid.
@@ -89,9 +102,12 @@ private:
 	// into explicit collision_surface arrays, so model triangles can be appended afterwards.
 	void promote_terrain_collision(VoxelMesher::Output &output) const;
 
-	// Adds the CUSTOM1 material-id stream to the Transvoxel surface(s) and declares both custom
-	// vertex stream formats (CUSTOM0 and CUSTOM1) in output.mesh_flags, so every surface --
-	// terrain and models -- ends up with the same vertex format.
+	// Adds the per-vertex material-id stream to the Transvoxel surface(s) and declares the
+	// custom vertex stream formats in output.mesh_flags, so every surface -- terrain and
+	// models -- ends up with the same vertex format. When the inner Transvoxel mesher's
+	// texturing mode is TEXTURES_NONE the material id goes into CUSTOM1 (1 float); when
+	// texturing is active CUSTOM1 is owned by Transvoxel's 2-float texture data and the
+	// material id is written to CUSTOM2 instead.
 	void finalize_terrain_surfaces(VoxelMesher::Output &output) const;
 
 	// Returns true if any model voxel exists, and writes a flattened SDF copy into `dst`.

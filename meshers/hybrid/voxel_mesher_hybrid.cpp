@@ -79,27 +79,35 @@ void append_to_collision_surface(VoxelMesher::Output::CollisionSurface &col, con
 }
 
 // All surfaces of the hybrid mesh share one vertex format so the terrain can render them with a
-// single material_override (the default LOD shader). Two custom vertex streams are used:
+// single material_override (the default LOD shader). Up to three custom vertex streams are used:
 //   CUSTOM0 (4x float): Transvoxel LOD attributes -- secondary position + packed border masks.
 //                       The shader needs it on surface 0 for the transition cull; model surfaces
 //                       carry an inert value (secondary == primary, all masks 0, transition 0)
 //                       so the same shader leaves them untouched.
-//   CUSTOM1 (1x float): per-vertex material id. 0 = smooth terrain, 1.. = model materials.
+//   CUSTOM1: either the per-vertex material id (1x float) when Transvoxel texturing is disabled,
+//            or the packed Mixel4/Single material indices+weights produced by Transvoxel
+//            (2x float) when texturing is enabled. Used by the shader for material lookup or
+//            blend-texturing.
+//   CUSTOM2 (1x float, only when texturing is enabled): per-vertex material id (0 = smooth
+//            terrain surface, 1.. = model surfaces). This separate stream is needed because
+//            CUSTOM1 is then owned by Transvoxel's texture data.
 constexpr int CUSTOM0_FLOATS_PER_VERTEX = 4;
-constexpr int CUSTOM1_FLOATS_PER_VERTEX = 1;
+// CUSTOM1 (no-texturing mode) and CUSTOM2 (texturing mode) both store one float per vertex.
+constexpr int MATERIAL_ID_FLOATS_PER_VERTEX = 1;
 
-// The mesh_flags bits declaring the format of the two custom streams. build_mesh() applies one
-// flags value to every surface, and every hybrid surface carries both CUSTOM0 and CUSTOM1, so
-// both format fields must always be declared.
-//
-// Both fields are declared unconditionally: the inner Transvoxel mesher sets the CUSTOM0 field
-// itself, but only when it actually produced a surface -- a chunk that has models but no smooth
-// terrain leaves mesh_flags at 0. Were CUSTOM0 left undeclared, Godot would read its format as 0
-// (ARRAY_CUSTOM_RGBA8_UNORM), which expects a PackedByteArray and rejects the PackedFloat32Array
-// the model surface supplies ("Invalid array format for surface").
-constexpr int HYBRID_CUSTOM_MESH_FLAGS =
+// Mesh_flags declaring the format of the custom streams when texturing is disabled. Both CUSTOM0
+// and CUSTOM1 are always declared, so a chunk with models but no smooth terrain still gets a
+// matching format on every surface ("Invalid array format" otherwise -- see build_model_surface).
+constexpr int HYBRID_CUSTOM_MESH_FLAGS_NO_TEXTURING =
 		(RenderingServerEnums::ARRAY_CUSTOM_RGBA_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM0_SHIFT) |
 		(RenderingServerEnums::ARRAY_CUSTOM_R_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM1_SHIFT);
+
+// Mesh_flags when Transvoxel texturing is enabled: CUSTOM1 carries Transvoxel's 2-float texture
+// data; CUSTOM2 carries the per-vertex material id the hybrid mesher uses to pick a colour.
+constexpr int HYBRID_CUSTOM_MESH_FLAGS_TEXTURED =
+		(RenderingServerEnums::ARRAY_CUSTOM_RGBA_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM0_SHIFT) |
+		(RenderingServerEnums::ARRAY_CUSTOM_RG_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM1_SHIFT) |
+		(RenderingServerEnums::ARRAY_CUSTOM_R_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM2_SHIFT);
 
 // Builds the inert CUSTOM0 stream for a model surface: secondary position equals the primary
 // position and every packed mask byte is 0, so the LOD shader neither moves nor culls these
@@ -117,15 +125,31 @@ PackedFloat32Array build_model_custom0(const StdVector<Vector3f> &positions) {
 	return custom0;
 }
 
-// Builds the CUSTOM1 stream (one material id repeated for every vertex of a surface).
-PackedFloat32Array build_custom1_material_id(int vertex_count, float material_id) {
-	PackedFloat32Array custom1;
-	custom1.resize(static_cast<int64_t>(vertex_count) * CUSTOM1_FLOATS_PER_VERTEX);
-	float *w = custom1.ptrw();
+// Builds a CUSTOM stream containing the same single float (a material id) for every vertex.
+// Used for CUSTOM1 when texturing is disabled, and for CUSTOM2 when texturing is enabled.
+PackedFloat32Array build_material_id_stream(int vertex_count, float material_id) {
+	PackedFloat32Array stream;
+	stream.resize(static_cast<int64_t>(vertex_count) * MATERIAL_ID_FLOATS_PER_VERTEX);
+	float *w = stream.ptrw();
 	for (int i = 0; i < vertex_count; ++i) {
 		*w++ = material_id;
 	}
-	return custom1;
+	return stream;
+}
+
+// Builds an inert CUSTOM1 stream for model surfaces when texturing is enabled: Transvoxel's
+// shader expects 2 floats per vertex (packed indices + weights), but model surfaces have no
+// voxel-based material data. Zeros are written so the shader's texture sampler returns the
+// first texture with no weight, which is harmless -- the shader's CUSTOM2 material id branches
+// model surfaces away from texture sampling anyway.
+PackedFloat32Array build_model_inert_custom1_texturing(int vertex_count) {
+	PackedFloat32Array stream;
+	stream.resize(static_cast<int64_t>(vertex_count) * 2);
+	float *w = stream.ptrw();
+	for (int i = 0; i < vertex_count * 2; ++i) {
+		*w++ = 0.0f;
+	}
+	return stream;
 }
 
 } // namespace
@@ -188,6 +212,18 @@ unsigned int VoxelMesherHybrid::get_material_index_count() const {
 		count += _library->get_material_index_count();
 	}
 	return count;
+}
+
+void VoxelMesherHybrid::set_texturing_mode(VoxelMesherTransvoxel::TexturingMode mode) {
+	ERR_FAIL_COND(_transvoxel_mesher.is_null());
+	_transvoxel_mesher->set_texturing_mode(mode);
+}
+
+VoxelMesherTransvoxel::TexturingMode VoxelMesherHybrid::get_texturing_mode() const {
+	if (_transvoxel_mesher.is_null()) {
+		return VoxelMesherTransvoxel::TEXTURES_NONE;
+	}
+	return _transvoxel_mesher->get_texturing_mode();
 }
 
 void VoxelMesherHybrid::set_terrain_material(Ref<Material> material) {
@@ -280,6 +316,17 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 	dst.create(block_size);
 	dst.set_channel_depth(sdf_channel, src.get_channel_depth(sdf_channel));
 	dst.copy_channel_from(src, sdf_channel);
+	// Mixel4 texture data must travel along: Transvoxel reads CHANNEL_INDICES/CHANNEL_WEIGHTS to
+	// pick per-vertex material indices and blend weights. Without this copy, the flattened buffer
+	// reverts to the default indices/weights (slot 0 = material id 0) and every chunk containing a
+	// model voxel renders as a uniform fallback texture.
+	if (_transvoxel_mesher.is_valid()
+		&& _transvoxel_mesher->get_texturing_mode() != VoxelMesherTransvoxel::TEXTURES_NONE) {
+		for (const VoxelBuffer::ChannelId ch : { VoxelBuffer::CHANNEL_INDICES, VoxelBuffer::CHANNEL_WEIGHTS }) {
+			dst.set_channel_depth(ch, src.get_channel_depth(ch));
+			dst.copy_channel_from(src, ch);
+		}
+	}
 
 	const int sx = block_size.x;
 	const int sz = block_size.z;
@@ -485,10 +532,18 @@ void VoxelMesherHybrid::build(VoxelMesher::Output &output, const VoxelMesher::In
 void VoxelMesherHybrid::finalize_terrain_surfaces(VoxelMesher::Output &output) const {
 	ZN_PROFILE_SCOPE();
 
+	const bool texturing_enabled = (_transvoxel_mesher.is_valid()
+			&& _transvoxel_mesher->get_texturing_mode() != VoxelMesherTransvoxel::TEXTURES_NONE);
+
 	// All surfaces that exist at this point were produced by the inner Transvoxel mesher
 	// (model surfaces are appended later). Transvoxel already provides CUSTOM0; the hybrid
-	// mesher additionally needs CUSTOM1 (material id) on every surface, so the terrain renders
-	// with the same vertex format -- and the same single material_override -- as the models.
+	// mesher additionally needs a per-vertex material id on every surface, so the terrain
+	// renders with the same vertex format -- and the same single material_override -- as the
+	// models.
+	//
+	// Without Transvoxel texturing, the material id goes into CUSTOM1 (1 float). With Transvoxel
+	// texturing (Mixel4 / Single), CUSTOM1 is already owned by Transvoxel's 2-float texture data
+	// (indices+weights), so the material id is written to CUSTOM2 instead.
 	for (VoxelMesher::Output::Surface &surface : output.surfaces) {
 		Array &arrays = surface.arrays;
 		if (arrays.size() < Mesh::ARRAY_MAX) {
@@ -499,15 +554,20 @@ void VoxelMesherHybrid::finalize_terrain_surfaces(VoxelMesher::Output &output) c
 			continue;
 		}
 		// Material id 0 is the smooth terrain (see get_material_by_index / the LOD shader).
-		arrays[Mesh::ARRAY_CUSTOM1] = build_custom1_material_id(vertices.size(), 0.0f);
+		if (texturing_enabled) {
+			arrays[Mesh::ARRAY_CUSTOM2] = build_material_id_stream(vertices.size(), 0.0f);
+		} else {
+			arrays[Mesh::ARRAY_CUSTOM1] = build_material_id_stream(vertices.size(), 0.0f);
+		}
 	}
 
-	// Declare the format of both custom streams. build_mesh() applies these flags to every
-	// surface, and every surface -- terrain and models -- carries both CUSTOM0 and CUSTOM1.
-	// Both fields are set unconditionally rather than relying on Transvoxel having set CUSTOM0:
-	// a chunk with models but no smooth terrain leaves Transvoxel's mesh_flags at 0, and an
-	// undeclared CUSTOM0 field would make Godot reject the model surface (see HYBRID_CUSTOM_MESH_FLAGS).
-	output.mesh_flags |= HYBRID_CUSTOM_MESH_FLAGS;
+	// Declare the format of all custom streams. build_mesh() applies one mesh_flags value to
+	// every surface, so every surface -- terrain and models -- must carry the same set of
+	// custom streams. Streams are declared unconditionally even if a chunk has models but no
+	// smooth terrain (Transvoxel's mesh_flags = 0 in that case), because an undeclared CUSTOM0
+	// field would make Godot reject the model surface ("Invalid array format for surface").
+	output.mesh_flags |= texturing_enabled ? HYBRID_CUSTOM_MESH_FLAGS_TEXTURED
+										   : HYBRID_CUSTOM_MESH_FLAGS_NO_TEXTURING;
 }
 
 void VoxelMesherHybrid::promote_terrain_collision(VoxelMesher::Output &output) const {
@@ -645,6 +705,11 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 
 	const float lod_scale = (input.lod_index > 0) ? static_cast<float>(1 << input.lod_index) : 1.0f;
 
+	// Vertex-stream layout depends on Transvoxel's texturing mode (see finalize_terrain_surfaces).
+	// Evaluated once because every surface in this loop uses the same layout.
+	const bool texturing_enabled = (_transvoxel_mesher.is_valid()
+			&& _transvoxel_mesher->get_texturing_mode() != VoxelMesherTransvoxel::TEXTURES_NONE);
+
 	// Emit one mesh surface per material id. Surface material index is `1 + material_id`,
 	// because index 0 is reserved for the smooth terrain surface (see get_material_by_index).
 	for (auto &entry : acc) {
@@ -675,9 +740,13 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 		// material id N maps to surface material index 1 + N (see get_material_by_index).
 		const uint16_t surface_material_index = static_cast<uint16_t>(1 + material_id);
 
-		// CUSTOM0/CUSTOM1 give the model surface the same vertex format as the smooth
-		// surface, so one material_override (the default LOD shader) renders them all.
-		// CUSTOM1 carries the material id the shader uses to pick a colour.
+		// CUSTOM streams give the model surface the same vertex format as the smooth surface,
+		// so one material_override (the default LOD shader) renders them all. Layout depends on
+		// whether Transvoxel texturing is enabled (see finalize_terrain_surfaces for the matching
+		// scheme on terrain surfaces):
+		//   - texturing off: CUSTOM1 carries the material id directly.
+		//   - texturing on:  CUSTOM1 carries an inert 2-float texture stream (zeros), and the
+		//                    material id moves to CUSTOM2 so it stays separate from texture data.
 		Array arrays;
 		arrays.resize(Mesh::ARRAY_MAX);
 		arrays[Mesh::ARRAY_VERTEX] = gd_positions;
@@ -685,8 +754,14 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 		arrays[Mesh::ARRAY_TEX_UV] = gd_uvs;
 		arrays[Mesh::ARRAY_INDEX] = gd_indices;
 		arrays[Mesh::ARRAY_CUSTOM0] = build_model_custom0(sa.positions);
-		arrays[Mesh::ARRAY_CUSTOM1] =
-				build_custom1_material_id(gd_positions.size(), static_cast<float>(surface_material_index));
+		if (texturing_enabled) {
+			arrays[Mesh::ARRAY_CUSTOM1] = build_model_inert_custom1_texturing(gd_positions.size());
+			arrays[Mesh::ARRAY_CUSTOM2] =
+					build_material_id_stream(gd_positions.size(), static_cast<float>(surface_material_index));
+		} else {
+			arrays[Mesh::ARRAY_CUSTOM1] =
+					build_material_id_stream(gd_positions.size(), static_cast<float>(surface_material_index));
+		}
 
 		output.surfaces.push_back({ arrays, surface_material_index });
 
@@ -720,6 +795,9 @@ void VoxelMesherHybrid::_bind_methods() {
 	ClassDB::bind_method(
 			D_METHOD("get_flatten_terrain_under_models"), &Self::get_flatten_terrain_under_models
 	);
+
+	ClassDB::bind_method(D_METHOD("set_texturing_mode", "mode"), &Self::set_texturing_mode);
+	ClassDB::bind_method(D_METHOD("get_texturing_mode"), &Self::get_texturing_mode);
 
 	ADD_PROPERTY(
 			PropertyInfo(
@@ -759,6 +837,21 @@ void VoxelMesherHybrid::_bind_methods() {
 			PropertyInfo(Variant::BOOL, "flatten_terrain_under_models"),
 			"set_flatten_terrain_under_models",
 			"get_flatten_terrain_under_models"
+	);
+
+	// Texturing mode is exposed as an enum hint with the same values as VoxelMesherTransvoxel
+	// (which is where the work happens). The hybrid mesher itself only re-routes the per-vertex
+	// material id from CUSTOM1 to CUSTOM2 when the mode is non-NONE, so Transvoxel's texture
+	// data can live in CUSTOM1.
+	ADD_PROPERTY(
+			PropertyInfo(
+					Variant::INT,
+					"texturing_mode",
+					PROPERTY_HINT_ENUM,
+					"None,Mixel4 S4,Single S4"
+			),
+			"set_texturing_mode",
+			"get_texturing_mode"
 	);
 }
 
