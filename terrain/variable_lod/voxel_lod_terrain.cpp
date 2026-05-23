@@ -628,6 +628,8 @@ void VoxelLodTerrain::post_edit_area(Box3i p_box, bool update_mesh) {
 	}
 #endif
 
+	emit_signal(VoxelStringNames::get_singleton().area_edited, p_box.position, p_box.size);
+
 #ifdef TOOLS_ENABLED
 	// This is a workaround for a defect in the LegacyOctree streaming system:
 	// when no VoxelViewer is present, it still loads terrain, but some functionalities don't work properly.
@@ -4021,6 +4023,12 @@ void VoxelLodTerrain::_bind_methods() {
 
 	BIND_ENUM_CONSTANT(STREAMING_SYSTEM_LEGACY_OCTREE);
 	BIND_ENUM_CONSTANT(STREAMING_SYSTEM_CLIPBOX);
+
+	ADD_SIGNAL(MethodInfo(
+			"area_edited",
+			PropertyInfo(Variant::VECTOR3I, "origin"),
+			PropertyInfo(Variant::VECTOR3I, "size")
+	));
 
 	ADD_GROUP("Bounds", "");
 
