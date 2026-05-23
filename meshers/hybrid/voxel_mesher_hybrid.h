@@ -92,6 +92,13 @@ public:
 	void set_texturing_mode(VoxelMesherTransvoxel::TexturingMode mode);
 	VoxelMesherTransvoxel::TexturingMode get_texturing_mode() const;
 
+	// Forwarded to the inner Transvoxel mesher. When true, voxels with SDF > 0 (air) do not
+	// contribute to the Mixel4 cell aggregation and per-vertex weight interpolation. Without
+	// it, the generator's default indices on air voxels visually bleed into edits (e.g. an
+	// earth sphere built above grass terrain renders with a strong grass tint).
+	void set_textures_ignore_air_voxels(bool enabled);
+	bool get_textures_ignore_air_voxels() const;
+
 private:
 	// Builds the blocky model part into `output` (Surface 1, one surface per material).
 	// Also appends the model triangles to `output.collision_surface` so models are solid.

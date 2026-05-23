@@ -53,6 +53,14 @@ public:
 	// in one C++ call instead of thousands of GDExtension round-trips.
 	PackedInt32Array get_material_counts_in_sphere(Vector3 center, float radius) const;
 
+	// Like do_sphere with MODE_ADD on CHANNEL_SDF, but additionally sets CHANNEL_INDICES /
+	// CHANNEL_WEIGHTS to the given material on every voxel that transitions from empty
+	// (old_sdf > 0) to solid (new_sdf <= 0). Voxels that were already solid keep their
+	// existing Mixel4 material, so building a stone sphere into existing dirt does not
+	// repaint the dirt.
+	// Returns the number of newly filled voxels (useful for inventory accounting).
+	int do_sphere_add_with_material(Vector3 center, float radius, int material_index);
+
 	// TODO GDX: it seems binding a method taking a `Node*` fails to compile. It is supposed to be working.
 #if defined(ZN_GODOT)
 	Array separate_floating_chunks(AABB world_box, Node *parent_node);

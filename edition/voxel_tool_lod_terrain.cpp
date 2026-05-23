@@ -251,6 +251,94 @@ PackedInt32Array VoxelToolLodTerrain::get_material_counts_in_sphere(Vector3 cent
 	return out;
 }
 
+int VoxelToolLodTerrain::do_sphere_add_with_material(Vector3 center, float radius, int material_index) {
+	ZN_PROFILE_SCOPE();
+	ERR_FAIL_COND_V(_terrain == nullptr, 0);
+	ERR_FAIL_COND_V(material_index < 0 || material_index >= 16, 0);
+	if (radius <= 0.0f) {
+		return 0;
+	}
+
+	// Mirror what do_sphere(MODE_ADD) does, voxel-by-voxel, and only repaint Mixel4 material on
+	// voxels that transition from empty (old_sdf > 0) to solid (new_sdf <= 0). Existing solid
+	// voxels keep their original material -- this is the whole point of this method versus a
+	// blind do_sphere + TexturePaint, which would repaint underlying terrain that the sphere
+	// happens to overlap.
+	//
+	// MODE_ADD with SdfUnion at strength=1 is exactly min(old, sphere_sdf), see funcs.h.
+	const float sdf_scale = get_sdf_scale();
+	const Vector3i min_pos(
+			Math::floor(center.x - radius),
+			Math::floor(center.y - radius),
+			Math::floor(center.z - radius)
+	);
+	const Vector3i max_pos(
+			Math::ceil(center.x + radius),
+			Math::ceil(center.y + radius),
+			Math::ceil(center.z + radius)
+	);
+
+	const Box3i box = Box3i::from_min_max(min_pos, max_pos + Vector3i(1, 1, 1))
+							  .clipped(_terrain->get_voxel_bounds());
+	if (!is_area_editable(box)) {
+		ZN_PRINT_WARNING("Area not editable");
+		return 0;
+	}
+
+	VoxelData &data = _terrain->get_storage();
+	data.pre_generate_box(box);
+
+	VoxelSingleValue sdf_default;
+	sdf_default.f = constants::SDF_FAR_OUTSIDE;
+
+	// Encode the chosen material as Mixel4: dominant in slot 0 with full weight, the other 3 slots
+	// get distinct filler indices with zero weight (Mixel4 requires the 4 indices to be different).
+	uint8_t fill_slots[3];
+	int next = 0;
+	for (int candidate = 0; candidate < 16 && next < 3; ++candidate) {
+		if (candidate == material_index) {
+			continue;
+		}
+		fill_slots[next++] = static_cast<uint8_t>(candidate);
+	}
+	const uint16_t packed_indices = mixel4::encode_indices_to_packed_u16(
+			static_cast<uint8_t>(material_index), fill_slots[0], fill_slots[1], fill_slots[2]
+	);
+	const uint16_t packed_weights = mixel4::encode_weights_to_packed_u16_lossy(255, 0, 0, 0);
+
+	int filled_count = 0;
+
+	for (int z = min_pos.z; z <= max_pos.z; ++z) {
+		for (int y = min_pos.y; y <= max_pos.y; ++y) {
+			for (int x = min_pos.x; x <= max_pos.x; ++x) {
+				const Vector3i pos(x, y, z);
+				const float old_sdf = data.get_voxel(pos, VoxelBuffer::CHANNEL_SDF, sdf_default).f;
+				const Vector3 sample_pos(x, y, z);
+				const float sphere_sdf = sdf_scale * ((sample_pos - center).length() - radius);
+				const float new_sdf = math::min(old_sdf, sphere_sdf);
+				if (new_sdf == old_sdf) {
+					continue;
+				}
+				data.try_set_voxel_f(new_sdf, pos, VoxelBuffer::CHANNEL_SDF);
+				const bool was_empty = old_sdf > 0.0f;
+				const bool is_solid_now = new_sdf <= 0.0f;
+				if (was_empty && is_solid_now) {
+					data.try_set_voxel(packed_indices, pos, VoxelBuffer::CHANNEL_INDICES);
+					data.try_set_voxel(packed_weights, pos, VoxelBuffer::CHANNEL_WEIGHTS);
+					++filled_count;
+				}
+			}
+		}
+	}
+
+	// Padding matches do_sphere (see get_sdf_sphere_box in funcs.h): _post_edit needs to also
+	// cover neighbor blocks so their meshes regenerate at the seam. Without padding, seams
+	// between freshly-filled voxels and untouched neighbor blocks may render with stale
+	// indices/weights from the old mesh.
+	_post_edit(box.padded(2));
+	return filled_count;
+}
+
 template <typename Op_T>
 class VoxelToolAsyncEdit : public IThreadedTask {
 public:
@@ -683,6 +771,10 @@ void VoxelToolLodTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("do_sphere_async", "center", "radius"), &Self::do_sphere_async);
 	ClassDB::bind_method(
 			D_METHOD("get_material_counts_in_sphere", "center", "radius"), &Self::get_material_counts_in_sphere
+	);
+	ClassDB::bind_method(
+			D_METHOD("do_sphere_add_with_material", "center", "radius", "material_index"),
+			&Self::do_sphere_add_with_material
 	);
 #ifdef VOXEL_ENABLE_MESH_SDF
 	ClassDB::bind_method(D_METHOD("stamp_sdf", "mesh_sdf", "transform", "isolevel", "sdf_scale"), &Self::stamp_sdf);

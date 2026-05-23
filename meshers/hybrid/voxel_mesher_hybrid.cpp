@@ -226,6 +226,18 @@ VoxelMesherTransvoxel::TexturingMode VoxelMesherHybrid::get_texturing_mode() con
 	return _transvoxel_mesher->get_texturing_mode();
 }
 
+void VoxelMesherHybrid::set_textures_ignore_air_voxels(bool enabled) {
+	ERR_FAIL_COND(_transvoxel_mesher.is_null());
+	_transvoxel_mesher->set_textures_ignore_air_voxels(enabled);
+}
+
+bool VoxelMesherHybrid::get_textures_ignore_air_voxels() const {
+	if (_transvoxel_mesher.is_null()) {
+		return false;
+	}
+	return _transvoxel_mesher->get_textures_ignore_air_voxels();
+}
+
 void VoxelMesherHybrid::set_terrain_material(Ref<Material> material) {
 	_terrain_material = material;
 }
@@ -798,6 +810,11 @@ void VoxelMesherHybrid::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_texturing_mode", "mode"), &Self::set_texturing_mode);
 	ClassDB::bind_method(D_METHOD("get_texturing_mode"), &Self::get_texturing_mode);
+
+	ClassDB::bind_method(
+			D_METHOD("set_textures_ignore_air_voxels", "enabled"), &Self::set_textures_ignore_air_voxels
+	);
+	ClassDB::bind_method(D_METHOD("get_textures_ignore_air_voxels"), &Self::get_textures_ignore_air_voxels);
 
 	ADD_PROPERTY(
 			PropertyInfo(
