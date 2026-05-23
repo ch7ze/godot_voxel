@@ -2,6 +2,7 @@
 #include "../constants/voxel_string_names.h"
 #include "../generators/graph/voxel_generator_graph.h"
 #include "../meshers/blocky/voxel_mesher_blocky.h"
+#include "../storage/mixel4.h"
 #include "../storage/voxel_buffer_gd.h"
 #include "../storage/voxel_data_grid.h"
 #include "../terrain/variable_lod/voxel_lod_terrain.h"
@@ -168,6 +169,86 @@ void VoxelToolLodTerrain::do_hemisphere(Vector3 center, float radius, Vector3 fl
 void VoxelToolLodTerrain::do_path(Span<const Vector3> positions, Span<const float> radii) {
 	ZN_ASSERT_RETURN(_terrain != nullptr);
 	do_path_chunked(_terrain->get_storage(), positions, radii, true);
+}
+
+PackedInt32Array VoxelToolLodTerrain::get_material_counts_in_sphere(Vector3 center, float radius) const {
+	ZN_PROFILE_SCOPE();
+	PackedInt32Array out;
+	out.resize(16);
+	int32_t *out_ptr = out.ptrw();
+	for (int i = 0; i < 16; ++i) {
+		out_ptr[i] = 0;
+	}
+	ERR_FAIL_COND_V(_terrain == nullptr, out);
+	if (radius <= 0.0f) {
+		return out;
+	}
+
+	// Mirror what do_sphere(MODE_REMOVE) would do, voxel-by-voxel, and only count voxels that
+	// actually change state from solid (old_sdf <= 0) to empty (new_sdf > 0). This matches the
+	// visually disappearing volume rather than the sphere's geometric volume, which can be much
+	// larger than the actually removed surface layer when the sphere sits inside the terrain.
+	//
+	// SdfOperation16bit samples the shape at integer voxel positions (to_vec3f(pos)), not at
+	// voxel centers -- the same convention is used here for consistency with the edit.
+	// SdfSubtract with strength=1 (Builder.cs default) is exactly max(old, -sphere_sdf).
+	const float sdf_scale = get_sdf_scale();
+	const Vector3i min_pos(
+			Math::floor(center.x - radius),
+			Math::floor(center.y - radius),
+			Math::floor(center.z - radius)
+	);
+	const Vector3i max_pos(
+			Math::ceil(center.x + radius),
+			Math::ceil(center.y + radius),
+			Math::ceil(center.z + radius)
+	);
+
+	const VoxelData &data = _terrain->get_storage();
+	VoxelSingleValue sdf_default;
+	sdf_default.f = constants::SDF_FAR_OUTSIDE;
+	VoxelSingleValue idx_default;
+	idx_default.i = 0;
+	VoxelSingleValue weight_default;
+	weight_default.i = 0;
+
+	for (int z = min_pos.z; z <= max_pos.z; ++z) {
+		for (int y = min_pos.y; y <= max_pos.y; ++y) {
+			for (int x = min_pos.x; x <= max_pos.x; ++x) {
+				const Vector3i pos(x, y, z);
+				const float old_sdf = data.get_voxel(pos, VoxelBuffer::CHANNEL_SDF, sdf_default).f;
+				if (old_sdf > 0.0f) {
+					continue;
+				}
+				const Vector3 sample_pos(x, y, z);
+				const float sphere_sdf = sdf_scale * ((sample_pos - center).length() - radius);
+				const float new_sdf = math::max(old_sdf, -sphere_sdf);
+				if (new_sdf <= 0.0f) {
+					// Stays solid -- this voxel does not disappear from the mesh.
+					continue;
+				}
+				const uint16_t packed_indices =
+						static_cast<uint16_t>(data.get_voxel(pos, VoxelBuffer::CHANNEL_INDICES, idx_default).i);
+				const uint16_t packed_weights =
+						static_cast<uint16_t>(data.get_voxel(pos, VoxelBuffer::CHANNEL_WEIGHTS, weight_default).i);
+				const FixedArray<uint8_t, 4> indices = mixel4::decode_indices_from_packed_u16(packed_indices);
+				const FixedArray<uint8_t, 4> weights = mixel4::decode_weights_from_packed_u16(packed_weights);
+				unsigned int best_slot = 0;
+				uint8_t best_weight = weights[0];
+				for (unsigned int i = 1; i < 4; ++i) {
+					if (weights[i] > best_weight) {
+						best_weight = weights[i];
+						best_slot = i;
+					}
+				}
+				const uint8_t dominant = indices[best_slot];
+				if (dominant < 16) {
+					out_ptr[dominant] += 1;
+				}
+			}
+		}
+	}
+	return out;
 }
 
 template <typename Op_T>
@@ -600,6 +681,9 @@ void VoxelToolLodTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_voxel_f_interpolated", "position"), &Self::get_voxel_f_interpolated);
 	ClassDB::bind_method(D_METHOD("separate_floating_chunks", "box", "parent_node"), &Self::separate_floating_chunks);
 	ClassDB::bind_method(D_METHOD("do_sphere_async", "center", "radius"), &Self::do_sphere_async);
+	ClassDB::bind_method(
+			D_METHOD("get_material_counts_in_sphere", "center", "radius"), &Self::get_material_counts_in_sphere
+	);
 #ifdef VOXEL_ENABLE_MESH_SDF
 	ClassDB::bind_method(D_METHOD("stamp_sdf", "mesh_sdf", "transform", "isolevel", "sdf_scale"), &Self::stamp_sdf);
 #endif

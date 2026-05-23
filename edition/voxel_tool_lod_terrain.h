@@ -46,6 +46,13 @@ public:
 	void do_hemisphere(Vector3 center, float radius, Vector3 flat_direction, float smoothness);
 	float get_voxel_f_interpolated(Vector3 position) const override;
 
+	// Counts solid voxels inside the SDF sphere and aggregates their dominant Mixel4 material.
+	// Returns a PackedInt32Array of length 16, indexed by material id (0..15).
+	// Each entry holds the number of solid voxels in which that material had the highest weight.
+	// "Solid" means CHANNEL_SDF value <= 0. Useful to determine drops for a single do_sphere edit
+	// in one C++ call instead of thousands of GDExtension round-trips.
+	PackedInt32Array get_material_counts_in_sphere(Vector3 center, float radius) const;
+
 	// TODO GDX: it seems binding a method taking a `Node*` fails to compile. It is supposed to be working.
 #if defined(ZN_GODOT)
 	Array separate_floating_chunks(AABB world_box, Node *parent_node);
