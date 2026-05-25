@@ -1,16 +1,28 @@
-// Only include this in the mesher to define it once.
-// It is only in a separate header because I wanted to split things out.
+// Header-only meshing helpers for blocky fluids.
+// Originally restricted to a single translation unit; now safe to include from multiple
+// meshers (e.g. VoxelMesherBlocky and VoxelMesherHybrid) by marking the non-template
+// helpers `inline`. The template `generate_fluid_model` is already inline by nature.
 
-// #ifndef VOXEL_BLOCKY_FLUIDS_MESHING_IMPL_H
-// #define VOXEL_BLOCKY_FLUIDS_MESHING_IMPL_H
+#ifndef VOXEL_BLOCKY_FLUIDS_MESHING_IMPL_H
+#define VOXEL_BLOCKY_FLUIDS_MESHING_IMPL_H
 
+#include "../../constants/cube_tables.h"
 #include "../../util/containers/container_funcs.h"
+#include "../../util/containers/fixed_array.h"
+#include "../../util/containers/span.h"
+#include "../../util/math/constants.h"
+#include "../../util/math/funcs.h"
+#include "../../util/math/vector2f.h"
+#include "../../util/math/vector3f.h"
+#include "../../util/math/vector3i.h"
+#include "blocky_baked_library.h"
 #include "blocky_fluids.h"
 #include "voxel_blocky_fluid.h"
+#include <cstdint>
 
 namespace zylann::voxel::blocky {
 
-void copy(const BakedFluid::Surface &src, Vector2f src_uv, BakedModel::SideSurface &dst) {
+inline void copy(const BakedFluid::Surface &src, Vector2f src_uv, BakedModel::SideSurface &dst) {
 	copy(src.positions, dst.positions);
 
 	dst.uvs.resize(src.positions.size());
@@ -21,7 +33,7 @@ void copy(const BakedFluid::Surface &src, Vector2f src_uv, BakedModel::SideSurfa
 	copy(src.tangents, dst.tangents);
 }
 
-void copy_positions_normals_tangents(
+inline void copy_positions_normals_tangents(
 		const BakedFluid::Surface &src,
 		const Vector3f normal,
 		const uint32_t p_material_id,
@@ -42,7 +54,7 @@ void copy_positions_normals_tangents(
 	dst.collision_enabled = p_collision_enabled;
 }
 
-static const VoxelBlockyFluid::FlowState g_min_corners_mask_to_flowstate[16] = {
+inline constexpr VoxelBlockyFluid::FlowState g_min_corners_mask_to_flowstate[16] = {
 	// 0123
 	// ----
 	// 0000
@@ -79,7 +91,7 @@ static const VoxelBlockyFluid::FlowState g_min_corners_mask_to_flowstate[16] = {
 	VoxelBlockyFluid::FLOW_IDLE,
 };
 
-VoxelBlockyFluid::FlowState get_fluid_flow_state_from_corner_levels(
+inline VoxelBlockyFluid::FlowState get_fluid_flow_state_from_corner_levels(
 		//    3-------2
 		//   /|      /|        z
 		//  / |     / |       /
@@ -96,7 +108,7 @@ VoxelBlockyFluid::FlowState get_fluid_flow_state_from_corner_levels(
 	return g_min_corners_mask_to_flowstate[mask];
 }
 
-FixedArray<uint8_t, 4> get_corner_levels_from_fluid_levels(
+inline FixedArray<uint8_t, 4> get_corner_levels_from_fluid_levels(
 		//  8 7 6     z
 		//  5 4 3     |
 		//  2 1 0  x--o
@@ -117,7 +129,7 @@ FixedArray<uint8_t, 4> get_corner_levels_from_fluid_levels(
 	return corner_levels;
 }
 
-FixedArray<float, 4> get_corner_heights_from_corner_levels(
+inline FixedArray<float, 4> get_corner_heights_from_corner_levels(
 		const FixedArray<uint8_t, 4> corner_levels,
 		const BakedFluid &fluid
 ) {
@@ -143,12 +155,12 @@ FixedArray<float, 4> get_corner_heights_from_corner_levels(
 	return heights;
 }
 
-FixedArray<FixedArray<BakedModel::SideSurface, MAX_SURFACES>, Cube::SIDE_COUNT> &get_tls_fluid_sides_surfaces() {
+inline FixedArray<FixedArray<BakedModel::SideSurface, MAX_SURFACES>, Cube::SIDE_COUNT> &get_tls_fluid_sides_surfaces() {
 	static thread_local FixedArray<FixedArray<BakedModel::SideSurface, MAX_SURFACES>, Cube::SIDE_COUNT> tls_fluid_sides;
 	return tls_fluid_sides;
 }
 
-BakedModel::Surface &get_tls_fluid_top() {
+inline BakedModel::Surface &get_tls_fluid_top() {
 	static thread_local BakedModel::Surface tls_fluid_top;
 	return tls_fluid_top;
 }
@@ -397,7 +409,7 @@ bool generate_fluid_model(
 	return true;
 }
 
-void generate_preview_fluid_model(
+inline void generate_preview_fluid_model(
 		const BakedModel &model,
 		const uint16_t model_id,
 		const BakedLibrary &library,
@@ -425,4 +437,4 @@ void generate_preview_fluid_model(
 
 } // namespace zylann::voxel::blocky
 
-// #endif // VOXEL_BLOCKY_FLUIDS_MESHING_IMPL_H
+#endif // VOXEL_BLOCKY_FLUIDS_MESHING_IMPL_H

@@ -12,6 +12,8 @@
 #include "../../util/math/funcs.h"
 #include "../../util/profiling.h"
 #include "../blocky/blocky_baked_library.h"
+// generate_fluid_model template + side-culling helper come from the blocky mesher headers.
+#include "../blocky/blocky_fluids_meshing_impl.h"
 // For blocky::is_face_visible (neighbor side-culling), an exported inline helper.
 #include "../blocky/voxel_mesher_blocky.h"
 
@@ -649,66 +651,161 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 
 	ModelMeshAccumulator acc;
 
+	// TYPE-channel raw access: needed by generate_fluid_model (which indexes the buffer
+	// by linear index for its 9-neighbor reads). VoxelBuffer uses ZXY layout (see
+	// voxel_buffer.h:361), so y_jump=1, x_jump=size.y, z_jump=size.y*size.x.
+	// If the channel is uniform-compressed (no raw bytes available), we fall back to the
+	// per-voxel get_voxel path -- fluids cannot occur in that case anyway because a
+	// uniform block has the same id everywhere (no level variation).
+	const int y_jump = 1;
+	const int x_jump = block_size.y;
+	const int z_jump = block_size.y * block_size.x;
+
+	Span<const uint8_t> raw_channel;
+	const bool has_raw_channel = voxels.get_channel_as_bytes_read_only(type_channel, raw_channel);
+	const VoxelBuffer::Depth channel_depth = voxels.get_channel_depth(type_channel);
+
 	{
 		// Baked data is the only library data safe for multithreaded access.
 		RWLockRead lock(_library->get_baked_data_rw_lock());
 		const blocky::BakedLibrary &baked = _library->get_baked_data();
 
-		for (int z = min.z; z < max.z; ++z) {
-			for (int x = min.x; x < max.x; ++x) {
-				for (int y = min.y; y < max.y; ++y) {
-					const uint64_t voxel_id = voxels.get_voxel(Vector3i(x, y, z), type_channel);
+		// Per-voxel meshing body, templated on the TYPE-channel element type so the same code
+		// works for both DEPTH_8_BIT and DEPTH_16_BIT. type_buffer may be empty when the
+		// channel is uniform-compressed -- in that case the fluid branch is skipped (fluids
+		// require neighbor reads through the buffer index).
+		const auto mesh_voxel = [&](auto type_buffer_tag, int x, int y, int z) {
+			using TModelID = typename decltype(type_buffer_tag)::type;
+			const Span<const TModelID> type_buffer = type_buffer_tag.span;
 
-					if (voxel_id == blocky::AIR_ID || !baked.has_model(voxel_id)) {
+			const uint64_t voxel_id = voxels.get_voxel(Vector3i(x, y, z), type_channel);
+
+			if (voxel_id == blocky::AIR_ID || !baked.has_model(voxel_id)) {
+				return;
+			}
+			const blocky::BakedModel &baked_model = baked.models[voxel_id];
+			if (baked_model.empty) {
+				return;
+			}
+			const blocky::BakedModel::Model &model = baked_model.model;
+
+			// Position relative to the (unpadded) mesh origin.
+			const Vector3f voxel_offset(x - min.x, y - min.y, z - min.z);
+
+			// Neighbor side-culling: a cube side is only baked if its neighbor voxel
+			// does not occlude it. blocky::is_face_visible is the exported helper that
+			// VoxelMesherBlocky itself uses -- it handles air, transparency and the
+			// side-pattern test for non-cube models. The neighbor is read from the
+			// TYPE channel; the padding border carries the neighbor chunk's values,
+			// so this stays correct across chunk boundaries. Computed once per voxel
+			// since visibility depends on the neighbor, not on the surface/material.
+			//
+			// model.empty_sides_mask marks sides that the model itself never renders --
+			// fluid models in particular mark SIDE_POSITIVE_Y as empty because their top
+			// is rendered as an inner surface (fluid_top_surface) by generate_fluid_model,
+			// not as a side surface. Without this skip, the side loop below would emit
+			// stale TLS-cached top side geometry from a previous fluid voxel.
+			uint8_t visible_sides_mask = 0;
+			for (unsigned int side = 0; side < Cube::SIDE_COUNT; ++side) {
+				if ((model.empty_sides_mask & (1 << side)) != 0) {
+					continue;
+				}
+				const Vector3i npos = Vector3i(x, y, z) + Cube::g_side_normals[side];
+				const uint64_t neighbor_id = voxels.get_voxel(npos, type_channel);
+				if (blocky::is_face_visible(baked, baked_model, neighbor_id, side)) {
+					visible_sides_mask |= (1 << side);
+				}
+			}
+
+			// Fluid path: VoxelBlockyModelFluid baked models carry a fluid_index != NULL.
+			// generate_fluid_model overrides the model's static geometry with dynamic top/side
+			// surfaces whose corner heights are interpolated from the 9 horizontal neighbors,
+			// matching VoxelMesherBlocky's behavior. Requires raw type-buffer access.
+			Span<const blocky::BakedModel::Surface> model_surfaces = to_span(model.surfaces);
+			const FixedArray<FixedArray<blocky::BakedModel::SideSurface, blocky::MAX_SURFACES>, Cube::SIDE_COUNT>
+					*model_sides_surfaces = &model.sides_surfaces;
+			unsigned int surface_count = model.surface_count;
+
+			if (baked_model.fluid_index != blocky::NULL_FLUID_INDEX && type_buffer.size() > 0) {
+				const int voxel_index = y * y_jump + x * x_jump + z * z_jump;
+				if (!blocky::generate_fluid_model(
+							baked_model,
+							type_buffer,
+							voxel_index,
+							y_jump,
+							x_jump,
+							z_jump,
+							visible_sides_mask,
+							baked,
+							model_surfaces,
+							model_sides_surfaces
+					)) {
+					// Voxel completely covered by same-fluid neighbors: nothing to mesh.
+					return;
+				}
+				surface_count = 1;
+			}
+
+			for (unsigned int s = 0; s < surface_count; ++s) {
+				// Inner geometry of the model (or fluid top surface). Each surface has its own
+				// material id; geometry is grouped by that id so it becomes its own mesh surface.
+				const blocky::BakedModel::Surface &surface = model_surfaces[s];
+				acc[surface.material_id].append_geometry(
+						surface.positions, surface.normals, surface.uvs, surface.indices, voxel_offset
+				);
+				// Cube sides: only the ones not occluded by a neighbor. Side surfaces
+				// share the material id of their parent model surface.
+				for (unsigned int side = 0; side < Cube::SIDE_COUNT; ++side) {
+					if ((visible_sides_mask & (1 << side)) == 0) {
 						continue;
 					}
-					const blocky::BakedModel &baked_model = baked.models[voxel_id];
-					if (baked_model.empty) {
-						continue;
+					const blocky::BakedModel::SideSurface &side_surface = (*model_sides_surfaces)[side][s];
+					acc[surface.material_id].append_geometry(
+							side_surface.positions,
+							StdVector<Vector3f>(),
+							side_surface.uvs,
+							side_surface.indices,
+							voxel_offset
+					);
+				}
+			}
+		};
+
+		// Tag struct to pass both the element type and the typed span to the generic lambda.
+		// (Lambdas can't be explicit-template-parameter generic until C++20.)
+		struct Tag8 { using type = uint8_t; Span<const uint8_t> span; };
+		struct Tag16 { using type = uint16_t; Span<const uint16_t> span; };
+
+		// Dispatch on channel depth once outside the loop so the inner loop stays tight.
+		// When raw channel access is unavailable (uniform compression), we still iterate with
+		// an empty span -- the fluid branch is skipped, the rest of the meshing works via
+		// voxels.get_voxel() as before.
+		if (has_raw_channel && channel_depth == VoxelBuffer::DEPTH_8_BIT) {
+			const Tag8 tag{ raw_channel };
+			for (int z = min.z; z < max.z; ++z) {
+				for (int x = min.x; x < max.x; ++x) {
+					for (int y = min.y; y < max.y; ++y) {
+						mesh_voxel(tag, x, y, z);
 					}
-					const blocky::BakedModel::Model &model = baked_model.model;
-
-					// Position relative to the (unpadded) mesh origin.
-					const Vector3f voxel_offset(x - min.x, y - min.y, z - min.z);
-
-					// Neighbor side-culling: a cube side is only baked if its neighbor voxel
-					// does not occlude it. blocky::is_face_visible is the exported helper that
-					// VoxelMesherBlocky itself uses -- it handles air, transparency and the
-					// side-pattern test for non-cube models. The neighbor is read from the
-					// TYPE channel; the padding border carries the neighbor chunk's values,
-					// so this stays correct across chunk boundaries. Computed once per voxel
-					// since visibility depends on the neighbor, not on the surface/material.
-					uint8_t visible_sides_mask = 0;
-					for (unsigned int side = 0; side < Cube::SIDE_COUNT; ++side) {
-						const Vector3i npos = Vector3i(x, y, z) + Cube::g_side_normals[side];
-						const uint64_t neighbor_id = voxels.get_voxel(npos, type_channel);
-						if (blocky::is_face_visible(baked, baked_model, neighbor_id, side)) {
-							visible_sides_mask |= (1 << side);
-						}
+				}
+			}
+		} else if (has_raw_channel && channel_depth == VoxelBuffer::DEPTH_16_BIT) {
+			const Tag16 tag{ raw_channel.reinterpret_cast_to<const uint16_t>() };
+			for (int z = min.z; z < max.z; ++z) {
+				for (int x = min.x; x < max.x; ++x) {
+					for (int y = min.y; y < max.y; ++y) {
+						mesh_voxel(tag, x, y, z);
 					}
-
-					for (unsigned int s = 0; s < model.surface_count; ++s) {
-						// Inner geometry of the model. Each model surface has its own material
-						// id; geometry is grouped by that id so it becomes its own mesh surface.
-						const blocky::BakedModel::Surface &surface = model.surfaces[s];
-						acc[surface.material_id].append_geometry(
-								surface.positions, surface.normals, surface.uvs, surface.indices, voxel_offset
-						);
-						// Cube sides: only the ones not occluded by a neighbor. Side surfaces
-						// share the material id of their parent model surface.
-						for (unsigned int side = 0; side < Cube::SIDE_COUNT; ++side) {
-							if ((visible_sides_mask & (1 << side)) == 0) {
-								continue;
-							}
-							const blocky::BakedModel::SideSurface &side_surface = model.sides_surfaces[side][s];
-							acc[surface.material_id].append_geometry(
-									side_surface.positions,
-									StdVector<Vector3f>(),
-									side_surface.uvs,
-									side_surface.indices,
-									voxel_offset
-							);
-						}
+				}
+			}
+		} else {
+			// Fallback: no raw access or unsupported depth -- meshing still works, but fluids
+			// rendered as plain cubes (their static fallback). Empty span signals this.
+			const Tag16 tag{ Span<const uint16_t>() };
+			for (int z = min.z; z < max.z; ++z) {
+				for (int x = min.x; x < max.x; ++x) {
+					for (int y = min.y; y < max.y; ++y) {
+						mesh_voxel(tag, x, y, z);
 					}
 				}
 			}

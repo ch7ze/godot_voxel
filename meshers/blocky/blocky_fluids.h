@@ -5,7 +5,9 @@
 
 namespace zylann::voxel::blocky {
 
-void generate_preview_fluid_model(
+// Defined inline in blocky_fluids_meshing_impl.h.
+// The matching `inline` here keeps the declaration consistent with the definition.
+inline void generate_preview_fluid_model(
 		const BakedModel &model,
 		const uint16_t model_id,
 		const BakedLibrary &library,

@@ -5,6 +5,9 @@
 #include "../../util/containers/container_funcs.h"
 #include "../../util/godot/core/array.h"
 #include "blocky_fluids.h"
+// generate_preview_fluid_model is defined inline in this header; include it so the
+// definition is visible in this TU (not just the forward declaration in blocky_fluids.h).
+#include "blocky_fluids_meshing_impl.h"
 #include "blocky_material_indexer.h"
 #include "blocky_model_baking_context.h"
 #include "voxel_blocky_library_base.h"
