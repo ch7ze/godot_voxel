@@ -23,6 +23,33 @@
 
 namespace zylann::voxel {
 
+namespace {
+
+// Converts a world-space point + radius to terrain-local voxel space, given the terrain's
+// global transform. Mirrors the convention already used by raycast_generic_world: the caller
+// passes world coordinates, the operation works in voxel indices. Required for consistency
+// with raycast; otherwise scaling the terrain node would silently break edits while raycasts
+// keep working.
+//
+// For non-uniform scales the function uses the maximum-magnitude axis and warns once: edit
+// operations conceptually need a uniform scale factor for radius, and non-uniform terrain
+// transforms are an unsupported edge case in this fork.
+inline void world_to_local_sphere_lod(const Transform3D &to_world, Vector3 &io_center, float &io_radius) {
+	const Transform3D to_local = to_world.affine_inverse();
+	io_center = to_local.xform(io_center);
+	const Vector3 scale = to_world.basis.get_scale();
+	const float sx = Math::abs(scale.x);
+	const float sy = Math::abs(scale.y);
+	const float sz = Math::abs(scale.z);
+	if (!Math::is_equal_approx(sx, sy) || !Math::is_equal_approx(sy, sz)) {
+		ZN_PRINT_WARNING_ONCE("Non-uniform terrain scale: edit radius will use max axis scale");
+	}
+	const float s = math::max(math::max(sx, sy), math::max(sz, 0.00001f));
+	io_radius = io_radius / s;
+}
+
+} // namespace
+
 VoxelToolLodTerrain::VoxelToolLodTerrain(VoxelLodTerrain *terrain) : _terrain(terrain) {
 	ERR_FAIL_COND(terrain == nullptr);
 	// At the moment, only LOD0 is supported.
@@ -93,6 +120,11 @@ void VoxelToolLodTerrain::do_sphere(Vector3 center, float radius) {
 	ZN_PROFILE_SCOPE();
 	ERR_FAIL_COND(_terrain == nullptr);
 
+	// Argument is in world space (consistent with raycast). Convert to terrain-local voxel
+	// space so that scaling the terrain node (e.g. for finer voxel resolution) does not
+	// silently break edits.
+	world_to_local_sphere_lod(_terrain->get_global_transform(), center, radius);
+
 	ops::DoSphere op;
 	op.shape.center = to_vec3f(center);
 	op.shape.radius = radius;
@@ -131,12 +163,25 @@ void VoxelToolLodTerrain::do_hemisphere(Vector3 center, float radius, Vector3 fl
 	ZN_PROFILE_SCOPE();
 	ERR_FAIL_COND(_terrain == nullptr);
 
+	// World -> local. flat_direction is rotated by the transform's basis (no translation
+	// component). smoothness is a scalar in local space, but conceptually a soft-edge width;
+	// scaling it with the radius keeps the look consistent.
+	const Transform3D to_world = _terrain->get_global_transform();
+	const Transform3D to_local = to_world.affine_inverse();
+	const Vector3 center_local = to_local.xform(center);
+	const Vector3 flat_dir_local = to_local.basis.xform(flat_direction).normalized();
+	const Vector3 scale = to_world.basis.get_scale();
+	const float scale_max = math::max(
+			math::max(Math::abs(scale.x), Math::abs(scale.y)), math::max(Math::abs(scale.z), 0.00001f));
+	const float radius_local = radius / scale_max;
+	const float smoothness_local = smoothness / scale_max;
+
 	ops::DoShapeChunked<ops::SdfHemisphere, ops::VoxelDataGridAccess> op;
-	op.shape.center = to_vec3f(center);
-	op.shape.radius = radius;
-	op.shape.flat_direction = to_vec3f(flat_direction);
-	op.shape.plane_d = flat_direction.dot(center);
-	op.shape.smoothness = smoothness;
+	op.shape.center = to_vec3f(center_local);
+	op.shape.radius = radius_local;
+	op.shape.flat_direction = to_vec3f(flat_dir_local);
+	op.shape.plane_d = flat_dir_local.dot(center_local);
+	op.shape.smoothness = smoothness_local;
 	op.shape.sdf_scale = get_sdf_scale();
 	op.box = op.shape.get_box().clipped(_terrain->get_voxel_bounds());
 	op.mode = static_cast<ops::Mode>(get_mode());
@@ -168,7 +213,30 @@ void VoxelToolLodTerrain::do_hemisphere(Vector3 center, float radius, Vector3 fl
 
 void VoxelToolLodTerrain::do_path(Span<const Vector3> positions, Span<const float> radii) {
 	ZN_ASSERT_RETURN(_terrain != nullptr);
-	do_path_chunked(_terrain->get_storage(), positions, radii, true);
+	ZN_ASSERT_RETURN(positions.size() == radii.size());
+
+	// World -> local. Copy into local vectors because the input Span is const. Each radius
+	// is scaled by the max axis of the terrain transform basis (same as sphere ops).
+	const Transform3D to_world = _terrain->get_global_transform();
+	const Transform3D to_local = to_world.affine_inverse();
+	const Vector3 scale = to_world.basis.get_scale();
+	const float scale_max = math::max(
+			math::max(Math::abs(scale.x), Math::abs(scale.y)), math::max(Math::abs(scale.z), 0.00001f));
+
+	StdVector<Vector3> positions_local;
+	StdVector<float> radii_local;
+	positions_local.resize(positions.size());
+	radii_local.resize(radii.size());
+	for (size_t i = 0; i < positions.size(); ++i) {
+		positions_local[i] = to_local.xform(positions[i]);
+		radii_local[i] = radii[i] / scale_max;
+	}
+
+	do_path_chunked(
+			_terrain->get_storage(),
+			to_span(positions_local),
+			to_span(radii_local),
+			true);
 }
 
 PackedInt32Array VoxelToolLodTerrain::get_material_counts_in_sphere(Vector3 center, float radius) const {
@@ -183,6 +251,11 @@ PackedInt32Array VoxelToolLodTerrain::get_material_counts_in_sphere(Vector3 cent
 	if (radius <= 0.0f) {
 		return out;
 	}
+
+	// World-space sphere -> terrain-local voxel space, matching do_sphere(MODE_REMOVE).
+	// The two functions must use the same transform, otherwise the histogram and the
+	// actual carve disagree about which voxels are affected.
+	world_to_local_sphere_lod(_terrain->get_global_transform(), center, radius);
 
 	// Mirror what do_sphere(MODE_REMOVE) would do, voxel-by-voxel, and only count voxels that
 	// actually change state from solid (old_sdf <= 0) to empty (new_sdf > 0). This matches the
@@ -258,6 +331,9 @@ int VoxelToolLodTerrain::do_sphere_add_with_material(Vector3 center, float radiu
 	if (radius <= 0.0f) {
 		return 0;
 	}
+
+	// World-space sphere -> terrain-local voxel space, matching do_sphere.
+	world_to_local_sphere_lod(_terrain->get_global_transform(), center, radius);
 
 	// Mirror what do_sphere(MODE_ADD) does, voxel-by-voxel, and only repaint Mixel4 material on
 	// voxels that transition from empty (old_sdf > 0) to solid (new_sdf <= 0). Existing solid
@@ -373,6 +449,9 @@ private:
 
 void VoxelToolLodTerrain::do_sphere_async(Vector3 center, float radius) {
 	ERR_FAIL_COND(_terrain == nullptr);
+
+	// Same world->local convention as the synchronous do_sphere.
+	world_to_local_sphere_lod(_terrain->get_global_transform(), center, radius);
 
 	ops::DoSphere op;
 	op.shape.center = to_vec3f(center);
@@ -591,7 +670,11 @@ void VoxelToolLodTerrain::stamp_sdf(
 
 void VoxelToolLodTerrain::do_mesh(const VoxelMeshSDF &mesh_sdf, const Transform3D &transform, const float isolevel) {
 	ZN_ASSERT_RETURN(_terrain != nullptr);
-	do_mesh_chunked(mesh_sdf, _terrain->get_storage(), transform, isolevel, true);
+	// transform is the brush pose in world space. Pre-multiply with terrain-to-local so the
+	// operation runs in voxel coordinates, matching do_sphere and friends.
+	const Transform3D to_local = _terrain->get_global_transform().affine_inverse();
+	const Transform3D local_transform = to_local * transform;
+	do_mesh_chunked(mesh_sdf, _terrain->get_storage(), local_transform, isolevel, true);
 }
 
 #endif
@@ -604,6 +687,11 @@ void VoxelToolLodTerrain::do_graph(Ref<VoxelGeneratorGraph> graph, Transform3D t
 	ZN_PROFILE_SCOPE();
 	ZN_DSTACK();
 	ERR_FAIL_COND(_terrain == nullptr);
+
+	// transform is the brush pose in world space. Pre-multiply with terrain-to-local so the
+	// operation runs in voxel coordinates, matching do_sphere and friends.
+	const Transform3D to_local = _terrain->get_global_transform().affine_inverse();
+	transform = to_local * transform;
 
 	const Vector3 area_size = math::abs(transform.basis.xform(graph_base_size));
 
