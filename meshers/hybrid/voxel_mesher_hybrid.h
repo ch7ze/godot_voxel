@@ -44,6 +44,16 @@ public:
 	Ref<Material> get_material_by_index(unsigned int index) const override;
 	unsigned int get_material_index_count() const override;
 
+	// Material index that marks the smooth fluid iso-surface (CHANNEL_DATA5 pass). The
+	// variable-LOD terrain reads this to split the chunk mesh into a terrain ArrayMesh and a
+	// separate water ArrayMesh, each with its own ShaderMaterial. Keeping the value as a
+	// virtual override avoids leaking the hybrid mesher's surface-id convention into
+	// VoxelLodTerrain.
+	static constexpr int WATER_MATERIAL_INDEX = 1;
+	int get_water_material_index() const override {
+		return WATER_MATERIAL_INDEX;
+	}
+
 	// Default material applied by the terrain as a single material_override over the whole
 	// chunk mesh. It is a ShaderMaterial whose shader both handles Transvoxel LOD transitions
 	// (so transition triangles are correctly culled instead of showing as artifacts) and picks

@@ -51,11 +51,19 @@ public:
 		// Only used if `has_mesh_resource` is true (usually when meshes are allowed to be build in threads). Otherwise,
 		// mesh data will be in `surfaces` and has to be built on the main thread.
 		Ref<Mesh> mesh;
+		// Separate mesh for the fluid iso-surface, when the mesher emits one (see
+		// VoxelMesher::get_water_material_index). Null if the mesher does not split. Lives in
+		// its own ArrayMesh so VoxelMeshBlockVLT can put it on a separate DirectMeshInstance
+		// with a transparent ShaderMaterial as material_override, independent from the opaque
+		// terrain material.
+		Ref<Mesh> water_mesh;
 		Ref<Mesh> shadow_occluder_mesh;
 		// Remaps Mesh surface indices to Mesher material indices. Only used if `has_mesh_resource` is true.
 		// TODO Optimize: candidate for small vector optimization. A big majority of meshes will have a handful of
 		// surfaces, which would fit here without allocating.
 		StdVector<uint16_t> mesh_material_indices;
+		// Same remap for the water mesh, when split out. Empty when water_mesh is null.
+		StdVector<uint16_t> water_mesh_material_indices;
 		// In mesh block coordinates
 		Vector3i position;
 		// TODO Rename lod_index

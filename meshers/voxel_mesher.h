@@ -112,6 +112,16 @@ public:
 	// Get the highest+1 material index
 	virtual unsigned int get_material_index_count() const;
 
+	// If the mesher emits a dedicated semi-transparent fluid iso-surface, this returns the
+	// material_index that marks fluid surfaces in the Output. Returning -1 disables the split:
+	// VoxelLodTerrain will then build a single ArrayMesh for the block and ignore any fluid
+	// material. Used by variable-LOD terrain to render fluid as a separate mesh instance with
+	// its own ShaderMaterial (so the terrain's opaque material_override does not blanket-cover
+	// the transparent fluid surface).
+	virtual int get_water_material_index() const {
+		return -1;
+	}
+
 #ifdef TOOLS_ENABLED
 	// If the mesher has problems, messages may be returned by this method so they can be shown to the user.
 	virtual void get_configuration_warnings(PackedStringArray &out_warnings) const {}

@@ -47,6 +47,12 @@ VoxelMeshBlockVLT::~VoxelMeshBlockVLT() {
 			FreeMeshTask::try_add_and_destroy(tmi);
 		}
 	}
+
+	if (_water_mesh_instance.is_valid()) {
+		// Same rationale as the terrain mesh_instance above: drop the material reference
+		// before the mesh instance is destroyed.
+		_water_mesh_instance.set_material_override(Ref<Material>());
+	}
 }
 
 void VoxelMeshBlockVLT::set_mesh(
@@ -143,6 +149,12 @@ void VoxelMeshBlockVLT::drop_visuals() {
 		}
 	}
 
+	if (_water_mesh_instance.is_valid()) {
+		_water_mesh_instance.set_material_override(Ref<Material>());
+		FreeMeshTask::try_add_and_destroy(_water_mesh_instance);
+	}
+	_water_shader_material = Ref<ShaderMaterial>();
+
 	detail_texture_fallback_level = 0;
 	fading_state = FADING_NONE;
 	fading_progress = 0.f;
@@ -158,6 +170,9 @@ void VoxelMeshBlockVLT::set_gi_mode(GeometryInstance3D::GIMode mode) {
 			mi.set_gi_mode(mode);
 		}
 	}
+	if (_water_mesh_instance.is_valid()) {
+		_water_mesh_instance.set_gi_mode(mode);
+	}
 }
 
 void VoxelMeshBlockVLT::set_shadow_casting(RenderingServerEnums::ShadowCastingSetting mode) {
@@ -169,6 +184,9 @@ void VoxelMeshBlockVLT::set_shadow_casting(RenderingServerEnums::ShadowCastingSe
 			mi.set_cast_shadows_setting(mode);
 		}
 	}
+	if (_water_mesh_instance.is_valid()) {
+		_water_mesh_instance.set_cast_shadows_setting(mode);
+	}
 }
 
 void VoxelMeshBlockVLT::set_render_layers_mask(int mask) {
@@ -178,6 +196,9 @@ void VoxelMeshBlockVLT::set_render_layers_mask(int mask) {
 		if (mi.is_valid()) {
 			mi.set_render_layers_mask(mask);
 		}
+	}
+	if (_water_mesh_instance.is_valid()) {
+		_water_mesh_instance.set_render_layers_mask(mask);
 	}
 }
 
@@ -252,6 +273,10 @@ void VoxelMeshBlockVLT::_set_visible(bool visible) {
 			set_mesh_instance_visible(mi, visible && _is_transition_visible(dir));
 		}
 	}
+
+	if (_water_mesh_instance.is_valid()) {
+		set_mesh_instance_visible(_water_mesh_instance, visible);
+	}
 }
 
 void VoxelMeshBlockVLT::set_shader_material(Ref<ShaderMaterial> material) {
@@ -276,6 +301,48 @@ void VoxelMeshBlockVLT::set_material_override(Ref<Material> material) {
 #endif
 	_shader_material = Ref<ShaderMaterial>();
 	set_material_override_internal(material);
+}
+
+void VoxelMeshBlockVLT::set_water_mesh(
+		Ref<Mesh> mesh,
+		GeometryInstance3D::GIMode gi_mode,
+		RenderingServerEnums::ShadowCastingSetting shadow_casting,
+		int render_layers_mask
+) {
+	if (mesh.is_valid()) {
+		if (!_water_mesh_instance.is_valid()) {
+			_water_mesh_instance.create();
+			_water_mesh_instance.set_interpolated(false);
+			_water_mesh_instance.set_gi_mode(gi_mode);
+			_water_mesh_instance.set_cast_shadows_setting(shadow_casting);
+			_water_mesh_instance.set_render_layers_mask(render_layers_mask);
+			// set_mesh_instance_visible() attaches the instance to _world when visible, so no
+			// explicit set_world() call is needed here (mirrors the terrain _mesh_instance path).
+			set_mesh_instance_visible(_water_mesh_instance, _visible && _parent_visible);
+		}
+		_water_mesh_instance.set_mesh(mesh);
+		if (_water_shader_material.is_valid()) {
+			_water_mesh_instance.set_material_override(_water_shader_material);
+		}
+	} else {
+		if (_water_mesh_instance.is_valid()) {
+			_water_mesh_instance.set_material_override(Ref<Material>());
+			_water_mesh_instance.destroy();
+		}
+	}
+}
+
+void VoxelMeshBlockVLT::set_water_shader_material(Ref<ShaderMaterial> material) {
+	_water_shader_material = material;
+	if (_water_mesh_instance.is_valid()) {
+		_water_mesh_instance.set_material_override(material);
+	}
+	if (_water_shader_material.is_valid()) {
+		const Transform3D local_transform(Basis(), _position_in_voxels);
+		const VoxelStringNames &sn = VoxelStringNames::get_singleton();
+		_water_shader_material->set_shader_parameter(sn.u_block_local_transform, local_transform);
+		_water_shader_material->set_shader_parameter(sn.u_voxel_virtual_texture_offset_scale, Vector4(0, 0, 0, 1));
+	}
 }
 
 void VoxelMeshBlockVLT::set_material_override_internal(Ref<Material> material) {
@@ -309,7 +376,7 @@ void VoxelMeshBlockVLT::set_transition_mask(uint8_t m) {
 		return;
 	}
 	_transition_mask = m;
-	if (_shader_material.is_valid()) {
+	if (_shader_material.is_valid() || _water_shader_material.is_valid()) {
 		// TODO Needs translation here, because Cube:: tables use slightly different order...
 		// We may get rid of this once cube tables respects -x+x-y+y-z+z order
 		uint8_t bits[Cube::SIDE_COUNT];
@@ -324,7 +391,16 @@ void VoxelMeshBlockVLT::set_transition_mask(uint8_t m) {
 		tm |= bits[Cube::SIDE_POSITIVE_Z] << 5;
 
 		// TODO Godot 4: we may replace this with a per-instance parameter so we can lift material access limitation
-		_shader_material->set_shader_parameter(VoxelStringNames::get_singleton().u_transition_mask, tm);
+		const StringName tm_param = VoxelStringNames::get_singleton().u_transition_mask;
+		if (_shader_material.is_valid()) {
+			_shader_material->set_shader_parameter(tm_param, tm);
+		}
+		// The fluid surface uses its own ShaderMaterial; if it shares the terrain's Transvoxel
+		// transition convention (which it does for the hybrid mesher), the same uniform name
+		// drives transition culling on its side too.
+		if (_water_shader_material.is_valid()) {
+			_water_shader_material->set_shader_parameter(tm_param, tm);
+		}
 	}
 	for (int dir = 0; dir < Cube::SIDE_COUNT; ++dir) {
 		DirectMeshInstance &mi = _transition_mesh_instances[dir];
@@ -345,7 +421,7 @@ void VoxelMeshBlockVLT::set_parent_visible(bool parent_visible) {
 void VoxelMeshBlockVLT::set_parent_transform(const Transform3D &parent_transform) {
 	ZN_PROFILE_SCOPE();
 
-	if (_mesh_instance.is_valid() || _static_body.is_valid()) {
+	if (_mesh_instance.is_valid() || _static_body.is_valid() || _water_mesh_instance.is_valid()) {
 		// TODO Optimize: could be optimized due to the basis being identity
 		const Transform3D local_transform(Basis(), _position_in_voxels);
 		const Transform3D world_transform = parent_transform * local_transform;
@@ -359,6 +435,10 @@ void VoxelMeshBlockVLT::set_parent_transform(const Transform3D &parent_transform
 					mi.set_transform(world_transform);
 				}
 			}
+		}
+
+		if (_water_mesh_instance.is_valid()) {
+			_water_mesh_instance.set_transform(world_transform);
 		}
 
 		if (_shadow_occluder.is_valid()) {

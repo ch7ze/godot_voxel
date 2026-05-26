@@ -96,6 +96,23 @@ public:
 	// To be used only if the material override on the terrain is not a ShaderMaterial
 	void set_material_override(Ref<Material> material);
 
+	// Optional separate mesh for the water (fluid) surface. Lives on its own DirectMeshInstance
+	// with its own ShaderMaterial, so the terrain's opaque material_override does not blanket
+	// the transparent fluid material. Pass null to drop the water mesh on this block.
+	void set_water_mesh(
+			Ref<Mesh> mesh,
+			GeometryInstance3D::GIMode gi_mode,
+			RenderingServerEnums::ShadowCastingSetting shadow_casting,
+			int render_layers_mask
+	);
+	void set_water_shader_material(Ref<ShaderMaterial> material);
+	inline Ref<ShaderMaterial> get_water_shader_material() const {
+		return _water_shader_material;
+	}
+	inline bool has_water_mesh() const {
+		return _water_mesh_instance.is_valid();
+	}
+
 	// Transform
 
 	void set_parent_transform(const Transform3D &parent_transform);
@@ -133,6 +150,13 @@ private:
 	FixedArray<zylann::godot::DirectMeshInstance, Cube::SIDE_COUNT> _transition_mesh_instances;
 
 	uint8_t _transition_mask = 0;
+
+	// Optional water mesh + material, used when the mesher emits a separate fluid surface
+	// (see VoxelMesher::get_water_material_index). Kept on its own DirectMeshInstance so it
+	// can carry a transparent ShaderMaterial as material_override, independent of the
+	// terrain's opaque material. Stays invalid for blocks without any fluid surface.
+	zylann::godot::DirectMeshInstance _water_mesh_instance;
+	Ref<ShaderMaterial> _water_shader_material;
 
 	// See VoxelMesherBlocky.
 	// This unfortunately has to be a whole separate mesh instance because Godot doesn't support setting

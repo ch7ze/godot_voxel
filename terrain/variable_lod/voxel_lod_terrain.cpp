@@ -62,10 +62,24 @@ void remove_shader_material_from_block(VoxelMeshBlockVLT &block, ShaderMaterialP
 	}
 }
 
+void remove_water_shader_material_from_block(
+		VoxelMeshBlockVLT &block,
+		ShaderMaterialPoolVLT &water_shader_material_pool
+) {
+	ZN_PROFILE_SCOPE();
+	Ref<ShaderMaterial> sm = block.get_water_shader_material();
+	if (sm.is_valid()) {
+		water_shader_material_pool.recycle(sm);
+		block.set_water_shader_material(Ref<ShaderMaterial>());
+	}
+}
+
 struct BeforeUnloadMeshAction {
 	ShaderMaterialPoolVLT &shader_material_pool;
+	ShaderMaterialPoolVLT &water_shader_material_pool;
 	void operator()(VoxelMeshBlockVLT &block) {
 		remove_shader_material_from_block(block, shader_material_pool);
+		remove_water_shader_material_from_block(block, water_shader_material_pool);
 	}
 };
 
@@ -392,6 +406,60 @@ void VoxelLodTerrain::update_shader_material_pool_template() {
 		shader_material = _mesher->get_default_lod_material();
 	}
 	_shader_material_pool.set_template(shader_material);
+}
+
+void VoxelLodTerrain::update_water_shader_material_pool_template() {
+	// Water has no default LOD shader from the mesher: if the game doesn't assign one, the
+	// pool stays empty and no water mesh is rendered (mesher output for water surfaces is
+	// then dropped in apply_mesh_update_to_block).
+	Ref<ShaderMaterial> shader_material = _water_material;
+	_water_shader_material_pool.set_template(shader_material);
+}
+
+Ref<Material> VoxelLodTerrain::get_water_material() const {
+	return _water_material;
+}
+
+void VoxelLodTerrain::set_water_material(Ref<Material> p_material) {
+	if (_water_material == p_material) {
+		return;
+	}
+
+	_water_material = p_material;
+
+	const unsigned int lod_count = get_lod_count();
+	Ref<ShaderMaterial> shader_material = p_material;
+
+	update_water_shader_material_pool_template();
+
+	// Refresh existing blocks: allocate a fresh per-block water material from the new
+	// template (or drop the per-block material entirely if the new template is empty).
+	if (shader_material.is_valid() && _water_shader_material_pool.get_template().is_valid()) {
+		for (unsigned int lod_index = 0; lod_index < lod_count; ++lod_index) {
+			VoxelMeshMap<VoxelMeshBlockVLT> &map = _mesh_maps_per_lod[lod_index];
+
+			map.for_each_block([this](VoxelMeshBlockVLT &block) { //
+				if (!block.has_water_mesh()) {
+					return;
+				}
+				Ref<ShaderMaterial> sm = _water_shader_material_pool.allocate();
+				Ref<ShaderMaterial> prev_material = block.get_water_shader_material();
+				if (prev_material.is_valid()) {
+					ZN_ASSERT_RETURN(sm.is_valid());
+					copy_vlt_block_params(**prev_material, **sm);
+				}
+				block.set_water_shader_material(sm);
+			});
+		}
+	} else {
+		for (unsigned int lod_index = 0; lod_index < lod_count; ++lod_index) {
+			VoxelMeshMap<VoxelMeshBlockVLT> &map = _mesh_maps_per_lod[lod_index];
+
+			map.for_each_block([this](VoxelMeshBlockVLT &block) { //
+				remove_water_shader_material_from_block(block, _water_shader_material_pool);
+			});
+		}
+	}
 }
 
 void VoxelLodTerrain::set_mesher(Ref<VoxelMesher> p_mesher) {
@@ -925,7 +993,7 @@ void VoxelLodTerrain::reset_mesh_maps() {
 		}
 #endif
 
-		// mesh_map.for_each_block(BeforeUnloadMeshAction{ _shader_material_pool });
+		// mesh_map.for_each_block(BeforeUnloadMeshAction{ _shader_material_pool, _water_shader_material_pool });
 
 		// Instance new maps if we have more lods, or clear them otherwise
 		if (lod_index < lod_count) {
@@ -1552,7 +1620,7 @@ void VoxelLodTerrain::apply_main_thread_update_tasks() {
 				fading_blocks_in_current_lod.erase(fading_block_it);
 			}
 
-			mesh_map.remove_block(bpos, BeforeUnloadMeshAction{ _shader_material_pool });
+			mesh_map.remove_block(bpos, BeforeUnloadMeshAction{ _shader_material_pool, _water_shader_material_pool });
 
 #ifdef VOXEL_ENABLE_INSTANCER
 			if (_instancer != nullptr) {
@@ -1927,24 +1995,59 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 	VoxelMesher::Output &mesh_data = ob.surfaces;
 
 	Ref<ArrayMesh> mesh;
+	Ref<ArrayMesh> water_mesh;
 	Ref<ArrayMesh> shadow_occluder_mesh;
 	if (ob.visual_was_required && visual_expected) {
 		// TODO Candidate for temp allocator
 		StdVector<uint16_t> material_indices;
+		StdVector<uint16_t> water_material_indices;
 		if (ob.has_mesh_resource) {
-			// The mesh was already built as part of the threaded task
+			// The mesh was already built as part of the threaded task. If the mesher emits a
+			// separate fluid surface (see VoxelMesher::get_water_material_index), the threaded
+			// task already split it out.
 			mesh = ob.mesh;
+			water_mesh = ob.water_mesh;
 			shadow_occluder_mesh = ob.shadow_occluder_mesh;
-			// It can be empty
+			// Either can be empty
 			material_indices = std::move(ob.mesh_material_indices);
+			water_material_indices = std::move(ob.water_mesh_material_indices);
 		} else {
-			// Can't build meshes in threads, do it here
-			mesh = build_mesh(
-					to_span_const(ob.surfaces.surfaces),
-					mesh_data.primitive_type,
-					mesh_data.mesh_flags,
-					material_indices
-			);
+			// Can't build meshes in threads, do it here. Mirror the split that the threaded
+			// path performs in MeshBlockTask::run().
+			const int water_index = _mesher->get_water_material_index();
+			if (water_index >= 0) {
+				StdVector<VoxelMesher::Output::Surface> terrain_surfaces;
+				StdVector<VoxelMesher::Output::Surface> water_surfaces;
+				terrain_surfaces.reserve(ob.surfaces.surfaces.size());
+				for (const VoxelMesher::Output::Surface &s : ob.surfaces.surfaces) {
+					if (static_cast<int>(s.material_index) == water_index) {
+						water_surfaces.push_back(s);
+					} else {
+						terrain_surfaces.push_back(s);
+					}
+				}
+				mesh = build_mesh(
+						to_span_const(terrain_surfaces),
+						mesh_data.primitive_type,
+						mesh_data.mesh_flags,
+						material_indices
+				);
+				if (water_surfaces.size() > 0) {
+					water_mesh = build_mesh(
+							to_span_const(water_surfaces),
+							mesh_data.primitive_type,
+							mesh_data.mesh_flags,
+							water_material_indices
+					);
+				}
+			} else {
+				mesh = build_mesh(
+						to_span_const(ob.surfaces.surfaces),
+						mesh_data.primitive_type,
+						mesh_data.mesh_flags,
+						material_indices
+				);
+			}
 			shadow_occluder_mesh = build_mesh(ob.surfaces.shadow_occluder);
 		}
 		if (mesh.is_valid()) {
@@ -1953,6 +2056,14 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 				const unsigned int material_index = material_indices[surface_index];
 				Ref<Material> material = _mesher->get_material_by_index(material_index);
 				mesh->surface_set_material(surface_index, material);
+			}
+		}
+		if (water_mesh.is_valid()) {
+			const unsigned int surface_count = water_mesh->get_surface_count();
+			for (unsigned int surface_index = 0; surface_index < surface_count; ++surface_index) {
+				const unsigned int material_index = water_material_indices[surface_index];
+				Ref<Material> material = _mesher->get_material_by_index(material_index);
+				water_mesh->surface_set_material(surface_index, material);
 			}
 		}
 	}
@@ -1964,7 +2075,7 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 		if (block != nullptr) {
 			// No surface anymore in this block, destroy it
 			// TODO Factor removal in a function, it's done in a few places
-			mesh_map.remove_block(ob.position, BeforeUnloadMeshAction{ _shader_material_pool });
+			mesh_map.remove_block(ob.position, BeforeUnloadMeshAction{ _shader_material_pool, _water_shader_material_pool });
 
 #ifdef VOXEL_ENABLE_INSTANCER
 			if (_instancer != nullptr) {
@@ -2061,6 +2172,24 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 				assign_material_after_mesh = true;
 			}
 
+			// Allocate a per-block water ShaderMaterial when the game has assigned one. The
+			// allocation is conditional on the block actually needing a water mesh; checking
+			// water_mesh.is_valid() defers the question until after the mesh is built.
+			if (_water_shader_material_pool.get_template().is_valid()
+				&& block->get_water_shader_material().is_null()
+				&& water_mesh.is_valid()) {
+				ZN_PROFILE_SCOPE_NAMED("Add water ShaderMaterial");
+				Ref<ShaderMaterial> wsm = _water_shader_material_pool.allocate();
+				if (wsm.is_valid() && _material_uses_lod_info) {
+					const int lod_count = get_lod_count();
+					wsm->set_shader_parameter(
+							VoxelStringNames::get_singleton().u_voxel_lod_info,
+							encode_lod_info_for_shader_uniform(ob.lod, lod_count)
+					);
+				}
+				block->set_water_shader_material(wsm);
+			}
+
 			block->set_transition_mask(transition_mask);
 		}
 
@@ -2082,6 +2211,16 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 				,
 				shadow_occluder_mode
 #endif
+		);
+
+		// Apply the optional fluid mesh. Passing null drops the water DirectMeshInstance if
+		// the previous build had one (e.g. water carved away). Water never participates in
+		// collision -- the mesher leaves col_*_end alone for the fluid pass.
+		block->set_water_mesh(
+				water_mesh,
+				get_gi_mode(),
+				RenderingServerEnums::ShadowCastingSetting(get_shadow_casting()),
+				get_render_layers_mask()
 		);
 
 		if (assign_material_after_mesh) {
@@ -3846,6 +3985,9 @@ void VoxelLodTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_material", "material"), &Self::set_material);
 	ClassDB::bind_method(D_METHOD("get_material"), &Self::get_material);
 
+	ClassDB::bind_method(D_METHOD("set_water_material", "material"), &Self::set_water_material);
+	ClassDB::bind_method(D_METHOD("get_water_material"), &Self::get_water_material);
+
 	// Bounds
 
 	ClassDB::bind_method(D_METHOD("set_view_distance", "distance_in_voxels"), &Self::set_view_distance);
@@ -4056,6 +4198,16 @@ void VoxelLodTerrain::_bind_methods() {
 			),
 			"set_material",
 			"get_material"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(
+					Variant::OBJECT,
+					"water_material",
+					PROPERTY_HINT_RESOURCE_TYPE,
+					zylann::godot::MATERIAL_3D_PROPERTY_HINT_STRING
+			),
+			"set_water_material",
+			"get_water_material"
 	);
 
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING

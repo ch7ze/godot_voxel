@@ -581,12 +581,43 @@ void MeshBlockTask::build_mesh() {
 	if (require_visual && VoxelEngine::get_singleton().is_threaded_graphics_resource_building_enabled()) {
 		// This can only run if the engine supports building meshes from multiple threads
 
-		_mesh = zylann::voxel::build_mesh(
-				to_span(_surfaces_output.surfaces),
-				_surfaces_output.primitive_type,
-				_surfaces_output.mesh_flags,
-				_mesh_material_indices
-		);
+		const int water_index = mesher->get_water_material_index();
+		if (water_index >= 0) {
+			// Split surfaces by material_index into terrain (everything else) and water. Two
+			// separate ArrayMeshes so VoxelLodTerrain can put them on distinct DirectMeshInstances
+			// with independent material_overrides. Surface order within each subset is preserved.
+			StdVector<VoxelMesher::Output::Surface> terrain_surfaces;
+			StdVector<VoxelMesher::Output::Surface> water_surfaces;
+			terrain_surfaces.reserve(_surfaces_output.surfaces.size());
+			for (const VoxelMesher::Output::Surface &s : _surfaces_output.surfaces) {
+				if (static_cast<int>(s.material_index) == water_index) {
+					water_surfaces.push_back(s);
+				} else {
+					terrain_surfaces.push_back(s);
+				}
+			}
+			_mesh = zylann::voxel::build_mesh(
+					to_span(terrain_surfaces),
+					_surfaces_output.primitive_type,
+					_surfaces_output.mesh_flags,
+					_mesh_material_indices
+			);
+			if (water_surfaces.size() > 0) {
+				_water_mesh = zylann::voxel::build_mesh(
+						to_span(water_surfaces),
+						_surfaces_output.primitive_type,
+						_surfaces_output.mesh_flags,
+						_water_mesh_material_indices
+				);
+			}
+		} else {
+			_mesh = zylann::voxel::build_mesh(
+					to_span(_surfaces_output.surfaces),
+					_surfaces_output.primitive_type,
+					_surfaces_output.mesh_flags,
+					_mesh_material_indices
+			);
+		}
 
 		if (_surfaces_output.shadow_occluder.size() > 0) {
 			_shadow_occluder_mesh = zylann::voxel::build_mesh(_surfaces_output.shadow_occluder);
@@ -636,8 +667,10 @@ void MeshBlockTask::apply_result() {
 			o.lod = lod_index;
 			o.surfaces = std::move(_surfaces_output);
 			o.mesh = _mesh;
+			o.water_mesh = _water_mesh;
 			o.shadow_occluder_mesh = _shadow_occluder_mesh;
 			o.mesh_material_indices = std::move(_mesh_material_indices);
+			o.water_mesh_material_indices = std::move(_water_mesh_material_indices);
 			o.has_mesh_resource = _has_mesh_resource;
 			o.visual_was_required = require_visual;
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING

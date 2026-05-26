@@ -96,8 +96,10 @@ private:
 	VoxelBuffer _voxels;
 	VoxelMesher::Output _surfaces_output;
 	Ref<Mesh> _mesh;
+	Ref<Mesh> _water_mesh;
 	Ref<Mesh> _shadow_occluder_mesh;
 	StdVector<uint16_t> _mesh_material_indices; // Indexed by mesh surface
+	StdVector<uint16_t> _water_mesh_material_indices;
 #ifdef VOXEL_ENABLE_SMOOTH_MESHING
 	std::shared_ptr<DetailTextureOutput> _detail_textures;
 #endif

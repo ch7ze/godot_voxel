@@ -41,6 +41,15 @@ public:
 	Ref<Material> get_material() const;
 	void set_material(Ref<Material> p_material);
 
+	// Optional second material used to render the fluid iso-surface emitted by the mesher
+	// (see VoxelMesher::get_water_material_index). Each block gets a per-block instance of
+	// this material via _water_shader_material_pool, so the same per-block uniforms that the
+	// terrain shader receives (u_transition_mask, u_block_local_transform, etc.) are also
+	// applied to the water surface. If null, no separate water mesh is rendered (the water
+	// surfaces fall back to surface-level materials from get_material_by_index).
+	Ref<Material> get_water_material() const;
+	void set_water_material(Ref<Material> p_material);
+
 	Ref<VoxelStream> get_stream() const override;
 	void set_stream(Ref<VoxelStream> p_stream) override;
 
@@ -334,6 +343,7 @@ private:
 	void _on_stream_params_changed();
 
 	void update_shader_material_pool_template();
+	void update_water_shader_material_pool_template();
 
 	void save_all_modified_blocks(bool with_copy, std::shared_ptr<AsyncDependencyTracker> tracker);
 
@@ -374,6 +384,7 @@ private:
 	ProcessCallback _process_callback = PROCESS_CALLBACK_IDLE;
 
 	Ref<Material> _material;
+	Ref<Material> _water_material;
 	bool _material_uses_lod_info = false;
 
 	// The main reason this pool even exists is because of this: https://github.com/godotengine/godot/issues/34741
@@ -385,6 +396,7 @@ private:
 	// The problem is, that also means every time `ShaderMaterial::duplicate()` is called, when it assigns `shader`,
 	// it has to add a connection to a HUGE list. Which is very slow, enough to cause stutters.
 	ShaderMaterialPoolVLT _shader_material_pool;
+	ShaderMaterialPoolVLT _water_shader_material_pool;
 
 	FixedArray<VoxelMeshMap<VoxelMeshBlockVLT>, constants::MAX_LOD> _mesh_maps_per_lod;
 
