@@ -588,21 +588,37 @@ void VoxelMesherHybrid::build_fluid_surfaces(VoxelMesher::Output &output, const 
 	// preserved verbatim:
 	//   - collision_surface submesh markers (the terrain promoted its collision already; fluid
 	//     does not contribute to collision),
+	//   - mesh_flags (the inner build() does `mesh_flags = ...` with `=`, not `|=`, so a second
+	//     pass would otherwise blow away the CUSTOM1/CUSTOM2 declarations
+	//     finalize_terrain_surfaces just made and the rendering server would reject the chunk
+	//     with "Invalid array format for surface"),
 	//   - the surface count (everything above this index is fluid output).
 	const int64_t terrain_collision_submesh_vertex_end = output.collision_surface.submesh_vertex_end;
 	const int64_t terrain_collision_submesh_index_end = output.collision_surface.submesh_index_end;
+	const uint32_t mesh_flags_before = output.mesh_flags;
 	const size_t surfaces_before = output.surfaces.size();
 
 	_fluid_transvoxel_mesher->build(output, input);
 
-	// Discard the fluid pass's collision contribution.
+	// Restore the snapshot. The fluid surfaces inherit the hybrid mesher's vertex format
+	// convention -- see the per-surface CUSTOM stream writes below.
 	output.collision_surface.submesh_vertex_end = terrain_collision_submesh_vertex_end;
 	output.collision_surface.submesh_index_end = terrain_collision_submesh_index_end;
+	output.mesh_flags = mesh_flags_before;
 
-	// Tag every newly-added Transvoxel surface with material id 1 (water). Layout matches
-	// finalize_terrain_surfaces, but with id=1 instead of id=0. The inner fluid mesher always
-	// runs in TEXTURES_NONE mode (see ctor), so the material id lives in CUSTOM1 regardless of
-	// what the terrain mesher is configured with.
+	// Tag every newly-added Transvoxel surface with material id 1 (water). The vertex format
+	// must match what finalize_terrain_surfaces / build_model_surface produce, because
+	// output.mesh_flags applies to every surface in the chunk: a mismatched CUSTOM slot
+	// triggers "Invalid array format for surface" from the rendering server.
+	//
+	// The inner fluid mesher runs in TEXTURES_NONE mode (see ctor) and therefore did not
+	// write CUSTOM1. The terrain mesher's mode decides where the material id has to live:
+	//   - texturing off: CUSTOM1 carries the material id (1 float).
+	//   - texturing on:  CUSTOM1 must be a 2-float texture-data stream (inert zeros), and
+	//                    the material id moves to CUSTOM2 (1 float).
+	const bool texturing_enabled = (_transvoxel_mesher.is_valid()
+			&& _transvoxel_mesher->get_texturing_mode() != VoxelMesherTransvoxel::TEXTURES_NONE);
+
 	for (size_t i = surfaces_before; i < output.surfaces.size(); ++i) {
 		VoxelMesher::Output::Surface &surface = output.surfaces[i];
 		Array &arrays = surface.arrays;
@@ -613,7 +629,12 @@ void VoxelMesherHybrid::build_fluid_surfaces(VoxelMesher::Output &output, const 
 		if (vertices.size() == 0) {
 			continue;
 		}
-		arrays[Mesh::ARRAY_CUSTOM1] = build_material_id_stream(vertices.size(), 1.0f);
+		if (texturing_enabled) {
+			arrays[Mesh::ARRAY_CUSTOM1] = build_model_inert_custom1_texturing(vertices.size());
+			arrays[Mesh::ARRAY_CUSTOM2] = build_material_id_stream(vertices.size(), 1.0f);
+		} else {
+			arrays[Mesh::ARRAY_CUSTOM1] = build_material_id_stream(vertices.size(), 1.0f);
+		}
 		surface.material_index = 1;
 	}
 }

@@ -61,6 +61,17 @@ public:
 	// Returns the number of newly filled voxels (useful for inventory accounting).
 	int do_sphere_add_with_material(Vector3 center, float radius, int material_index);
 
+	// Fluid sphere edits on CHANNEL_DATA5 (the smooth water iso-surface read by
+	// VoxelMesherHybrid's fluid Transvoxel pass). Independent from the terrain SDF -- the two
+	// volumes coexist on the same voxel grid but never overwrite each other.
+	//
+	// add: SDF union with the sphere (sdf = min(old, sphere_sdf)) -> fills the sphere with fluid.
+	// remove: SDF subtraction (sdf = max(old, -sphere_sdf))       -> carves fluid out of the sphere.
+	//
+	// Center/radius are in world space, consistent with do_sphere and raycast.
+	void do_sphere_fluid_add(Vector3 center, float radius);
+	void do_sphere_fluid_remove(Vector3 center, float radius);
+
 	// TODO GDX: it seems binding a method taking a `Node*` fails to compile. It is supposed to be working.
 #if defined(ZN_GODOT)
 	Array separate_floating_chunks(AABB world_box, Node *parent_node);
@@ -93,6 +104,11 @@ protected:
 
 private:
 	static void _bind_methods();
+
+	// Shared implementation behind do_sphere_fluid_add / do_sphere_fluid_remove.
+	// Identical to do_sphere() but with channel hardcoded to CHANNEL_DATA5 and mode
+	// passed in explicitly.
+	void run_fluid_sphere_op(Vector3 center, float radius, ops::Mode mode);
 
 	VoxelLodTerrain *_terrain = nullptr;
 	int _raycast_binary_search_iterations = 0;

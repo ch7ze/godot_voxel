@@ -415,6 +415,59 @@ int VoxelToolLodTerrain::do_sphere_add_with_material(Vector3 center, float radiu
 	return filled_count;
 }
 
+// Shared pipeline for the fluid-channel sphere edits. Identical to do_sphere() but with the
+// channel hardcoded to CHANNEL_DATA5 and the mode passed in, so the public methods do not
+// depend on VoxelTool::set_channel / set_mode state and cannot accidentally write to the
+// terrain SDF channel.
+void VoxelToolLodTerrain::run_fluid_sphere_op(Vector3 center, float radius, ops::Mode mode) {
+	ZN_PROFILE_SCOPE();
+	ERR_FAIL_COND(_terrain == nullptr);
+
+	world_to_local_sphere_lod(_terrain->get_global_transform(), center, radius);
+
+	ops::DoSphere op;
+	op.shape.center = to_vec3f(center);
+	op.shape.radius = radius;
+	op.shape.sdf_scale = get_sdf_scale();
+	op.box = op.shape.get_box().clipped(_terrain->get_voxel_bounds());
+	op.mode = mode;
+	op.texture_params = _texture_params;
+	op.blocky_value = 0;
+	// Fluid channel: independent from the terrain SDF. The hybrid mesher reads it via a
+	// second Transvoxel pass (see VoxelMesherHybrid::build_fluid_surfaces).
+	op.channel = VoxelBuffer::CHANNEL_DATA5;
+	op.strength = get_sdf_strength();
+
+	const Box3i world_box = op.box;
+
+	if (!is_area_editable(world_box)) {
+		ZN_PRINT_WARNING("Area not editable");
+		return;
+	}
+
+	VoxelData &data = _terrain->get_storage();
+	data.pre_generate_box(world_box);
+	data.get_blocks_grid(op.blocks, world_box, 0);
+
+	// Operate in block-relative coordinates so the inner loop can stay in floats.
+	const Vector3i origin_in_voxels = op.blocks.get_origin_block_position_in_voxels();
+	op.shape.center = to_vec3f(center - to_vec3(origin_in_voxels));
+	op.box.position -= origin_in_voxels;
+	op.blocks.use_relative_coordinates();
+
+	op();
+
+	_post_edit(world_box);
+}
+
+void VoxelToolLodTerrain::do_sphere_fluid_add(Vector3 center, float radius) {
+	run_fluid_sphere_op(center, radius, ops::MODE_ADD);
+}
+
+void VoxelToolLodTerrain::do_sphere_fluid_remove(Vector3 center, float radius) {
+	run_fluid_sphere_op(center, radius, ops::MODE_REMOVE);
+}
+
 template <typename Op_T>
 class VoxelToolAsyncEdit : public IThreadedTask {
 public:
@@ -863,6 +916,12 @@ void VoxelToolLodTerrain::_bind_methods() {
 	ClassDB::bind_method(
 			D_METHOD("do_sphere_add_with_material", "center", "radius", "material_index"),
 			&Self::do_sphere_add_with_material
+	);
+	ClassDB::bind_method(
+			D_METHOD("do_sphere_fluid_add", "center", "radius"), &Self::do_sphere_fluid_add
+	);
+	ClassDB::bind_method(
+			D_METHOD("do_sphere_fluid_remove", "center", "radius"), &Self::do_sphere_fluid_remove
 	);
 #ifdef VOXEL_ENABLE_MESH_SDF
 	ClassDB::bind_method(D_METHOD("stamp_sdf", "mesh_sdf", "transform", "isolevel", "sdf_scale"), &Self::stamp_sdf);
