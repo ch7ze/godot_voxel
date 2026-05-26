@@ -60,9 +60,14 @@ public:
 	void set_library(Ref<VoxelBlockyLibraryBase> library);
 	Ref<VoxelBlockyLibraryBase> get_library() const;
 
-	// Material for the smooth terrain surface (surface 0).
+	// Material for the smooth terrain surface (surface material id 0).
 	void set_terrain_material(Ref<Material> material);
 	Ref<Material> get_terrain_material() const;
+
+	// Material for the smooth fluid iso-surface (surface material id 1). Meshed from
+	// CHANNEL_DATA5 via a second Transvoxel pass inside build().
+	void set_water_material(Ref<Material> material);
+	Ref<Material> get_water_material() const;
 
 	// Fallback material for model surfaces whose library material slot is null
 	// (a library slot may be null to mean "the default material").
@@ -100,10 +105,15 @@ public:
 	bool get_textures_ignore_air_voxels() const;
 
 private:
-	// Builds the blocky model part into `output` (Surface 1, one surface per material).
+	// Builds the blocky model part into `output` (one surface per material).
 	// Also appends the model triangles to `output.collision_surface` so models are solid.
 	// No-op if no library is set.
 	void build_model_surface(VoxelMesher::Output &output, const VoxelMesher::Input &input);
+
+	// Runs the fluid Transvoxel pass on the same buffer and tags its surfaces with material id 1
+	// (water). The fluid pass does not contribute to collision -- collision_surface is preserved
+	// across the call so players can swim through the fluid surface.
+	void build_fluid_surfaces(VoxelMesher::Output &output, const VoxelMesher::Input &input);
 
 	// Converts the Transvoxel terrain collision (provided as a submesh range of surface 0)
 	// into explicit collision_surface arrays, so model triangles can be appended afterwards.
@@ -126,12 +136,18 @@ private:
 
 	static void _bind_methods();
 
-	// Reused as-is for the smooth SDF surface (Surface 0).
+	// Reused as-is for the smooth SDF surface (terrain, material id 0).
 	Ref<VoxelMesherTransvoxel> _transvoxel_mesher;
+
+	// Second Transvoxel instance configured to read CHANNEL_DATA5, producing the smooth fluid
+	// iso-surface (water, material id 1) in the same build() call. Always TEXTURES_NONE: fluid
+	// surfaces don't carry Mixel4 material weights.
+	Ref<VoxelMesherTransvoxel> _fluid_transvoxel_mesher;
 
 	Ref<VoxelBlockyLibraryBase> _library;
 
 	Ref<Material> _terrain_material;
+	Ref<Material> _water_material;
 	Ref<Material> _model_material;
 
 	// Colours fed into the default LOD shader (see set_terrain_color / set_model_colors).

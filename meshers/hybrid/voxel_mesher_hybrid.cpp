@@ -162,6 +162,13 @@ VoxelMesherHybrid::VoxelMesherHybrid() {
 	// (each model is self-contained within its voxel), so the Transvoxel requirements cover it.
 	set_padding(_transvoxel_mesher->get_minimum_padding(), _transvoxel_mesher->get_maximum_padding());
 
+	// Fluid pass: a second Transvoxel instance reading CHANNEL_DATA5. Texturing is left at
+	// TEXTURES_NONE so the fluid surface stays a single, untextured surface (its shader will
+	// drive the look from world-space coordinates instead of Mixel4 weights).
+	_fluid_transvoxel_mesher.instantiate();
+	_fluid_transvoxel_mesher->set_sdf_channel(VoxelBuffer::CHANNEL_DATA5);
+	_fluid_transvoxel_mesher->set_texturing_mode(VoxelMesherTransvoxel::TEXTURES_NONE);
+
 	// Create the default LOD material once. The terrain may request it through a const
 	// reference (get_default_lod_material), so it cannot be lazily created there.
 	{
@@ -177,8 +184,12 @@ VoxelMesherHybrid::VoxelMesherHybrid() {
 VoxelMesherHybrid::~VoxelMesherHybrid() {}
 
 int VoxelMesherHybrid::get_used_channels_mask() const {
-	// SDF for the smooth surface, TYPE for the blocky model surface.
+	// SDF for the smooth terrain surface, fluid-SDF (CHANNEL_DATA5) for the smooth water
+	// surface, TYPE for the blocky model surface.
 	int mask = _transvoxel_mesher->get_used_channels_mask();
+	if (_fluid_transvoxel_mesher.is_valid()) {
+		mask |= _fluid_transvoxel_mesher->get_used_channels_mask();
+	}
 	mask |= (1 << VoxelBuffer::CHANNEL_TYPE);
 	return mask;
 }
@@ -191,13 +202,16 @@ bool VoxelMesherHybrid::is_generating_collision_surface() const {
 }
 
 Ref<Material> VoxelMesherHybrid::get_material_by_index(unsigned int index) const {
-	// Index 0 is the smooth terrain surface.
+	// Index 0 is the smooth terrain surface, index 1 is the smooth water surface.
 	if (index == 0) {
 		return _terrain_material;
 	}
-	// Indices >= 1 map to the model library's materials (index 1 -> library material 0).
+	if (index == 1) {
+		return _water_material;
+	}
+	// Indices >= 2 map to the model library's materials (index 2 -> library material 0).
 	if (_library.is_valid()) {
-		const Ref<Material> lib_material = _library->get_material_by_index(index - 1);
+		const Ref<Material> lib_material = _library->get_material_by_index(index - 2);
 		// A library material slot may be null ("the default material"): fall back to
 		// the configurable model material so such models still get something to render.
 		if (lib_material.is_valid()) {
@@ -208,8 +222,8 @@ Ref<Material> VoxelMesherHybrid::get_material_by_index(unsigned int index) const
 }
 
 unsigned int VoxelMesherHybrid::get_material_index_count() const {
-	// 1 for the terrain surface, plus one slot per library material.
-	unsigned int count = 1;
+	// 1 for the terrain surface, 1 for the water surface, plus one slot per library material.
+	unsigned int count = 2;
 	if (_library.is_valid()) {
 		count += _library->get_material_index_count();
 	}
@@ -246,6 +260,14 @@ void VoxelMesherHybrid::set_terrain_material(Ref<Material> material) {
 
 Ref<Material> VoxelMesherHybrid::get_terrain_material() const {
 	return _terrain_material;
+}
+
+void VoxelMesherHybrid::set_water_material(Ref<Material> material) {
+	_water_material = material;
+}
+
+Ref<Material> VoxelMesherHybrid::get_water_material() const {
+	return _water_material;
 }
 
 void VoxelMesherHybrid::set_model_material(Ref<Material> material) {
@@ -530,17 +552,70 @@ void VoxelMesherHybrid::build(VoxelMesher::Output &output, const VoxelMesher::In
 		_transvoxel_mesher->build(output, input);
 	}
 
-	// Give the Transvoxel surface(s) the CUSTOM1 material-id stream so every surface of the
-	// final mesh shares one vertex format (model surfaces get CUSTOM1 in build_model_surface).
+	// Give the Transvoxel terrain surface(s) the CUSTOM1 material-id stream so every surface of
+	// the final mesh shares one vertex format (model surfaces get CUSTOM1 in build_model_surface).
+	// This tags the surfaces produced so far (terrain only) with material id 0. Must run before
+	// the fluid pass so that finalize_terrain_surfaces doesn't also tag the fluid surfaces as
+	// terrain.
 	finalize_terrain_surfaces(output);
 
 	// Convert the Transvoxel terrain collision (a submesh range of surface 0) into explicit
 	// collision_surface arrays, so the model triangles can be appended to the same collider.
+	// Must run before the fluid pass, since the fluid pass would otherwise overwrite the
+	// terrain's submesh_*_end markers with its own (fluid is not a collider).
 	promote_terrain_collision(output);
 
-	// Surface 1: sharp-edged 3D models baked from the TYPE channel.
-	// Also appends the model triangles to output.collision_surface.
+	// Smooth fluid iso-surface: meshed from CHANNEL_DATA5 by a second Transvoxel instance.
+	// Tagged with material id 1 (see get_material_by_index). The fluid surface is not part of
+	// the collider -- players should be able to enter water -- so collision_surface stays as
+	// promote_terrain_collision() left it.
+	build_fluid_surfaces(output, input);
+
+	// Sharp-edged 3D models baked from the TYPE channel. Each model material id N becomes
+	// surface material index 2 + N (terrain=0, water=1, models from 2). Appends the model
+	// triangles to output.collision_surface.
 	build_model_surface(output, input);
+}
+
+void VoxelMesherHybrid::build_fluid_surfaces(VoxelMesher::Output &output, const VoxelMesher::Input &input) {
+	ZN_PROFILE_SCOPE();
+
+	if (_fluid_transvoxel_mesher.is_null()) {
+		return;
+	}
+
+	// Snapshot state the inner Transvoxel build() may overwrite, so the terrain results are
+	// preserved verbatim:
+	//   - collision_surface submesh markers (the terrain promoted its collision already; fluid
+	//     does not contribute to collision),
+	//   - the surface count (everything above this index is fluid output).
+	const int64_t terrain_collision_submesh_vertex_end = output.collision_surface.submesh_vertex_end;
+	const int64_t terrain_collision_submesh_index_end = output.collision_surface.submesh_index_end;
+	const size_t surfaces_before = output.surfaces.size();
+
+	_fluid_transvoxel_mesher->build(output, input);
+
+	// Discard the fluid pass's collision contribution.
+	output.collision_surface.submesh_vertex_end = terrain_collision_submesh_vertex_end;
+	output.collision_surface.submesh_index_end = terrain_collision_submesh_index_end;
+
+	// Tag every newly-added Transvoxel surface with material id 1 (water). Layout matches
+	// finalize_terrain_surfaces, but with id=1 instead of id=0. The inner fluid mesher always
+	// runs in TEXTURES_NONE mode (see ctor), so the material id lives in CUSTOM1 regardless of
+	// what the terrain mesher is configured with.
+	for (size_t i = surfaces_before; i < output.surfaces.size(); ++i) {
+		VoxelMesher::Output::Surface &surface = output.surfaces[i];
+		Array &arrays = surface.arrays;
+		if (arrays.size() < Mesh::ARRAY_MAX) {
+			continue;
+		}
+		const PackedVector3Array vertices = arrays[Mesh::ARRAY_VERTEX];
+		if (vertices.size() == 0) {
+			continue;
+		}
+		arrays[Mesh::ARRAY_CUSTOM1] = build_material_id_stream(vertices.size(), 1.0f);
+		surface.material_index = 1;
+	}
 }
 
 void VoxelMesherHybrid::finalize_terrain_surfaces(VoxelMesher::Output &output) const {
@@ -819,8 +894,9 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 	const bool texturing_enabled = (_transvoxel_mesher.is_valid()
 			&& _transvoxel_mesher->get_texturing_mode() != VoxelMesherTransvoxel::TEXTURES_NONE);
 
-	// Emit one mesh surface per material id. Surface material index is `1 + material_id`,
-	// because index 0 is reserved for the smooth terrain surface (see get_material_by_index).
+	// Emit one mesh surface per material id. Surface material index is `2 + material_id`,
+	// because index 0 is reserved for the smooth terrain surface and index 1 for the smooth
+	// water surface (see get_material_by_index).
 	for (auto &entry : acc) {
 		const uint32_t material_id = entry.first;
 		SurfaceArrays &sa = entry.second;
@@ -845,9 +921,10 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 		copy_to(gd_uvs, to_span_const(sa.uvs));
 		copy_to(gd_indices, to_span_const(sa.indices));
 
-		// Surface material index: index 0 is reserved for the smooth terrain, so model
-		// material id N maps to surface material index 1 + N (see get_material_by_index).
-		const uint16_t surface_material_index = static_cast<uint16_t>(1 + material_id);
+		// Surface material index: index 0 is reserved for the smooth terrain and index 1 for
+		// the smooth water surface, so model material id N maps to surface material index
+		// 2 + N (see get_material_by_index).
+		const uint16_t surface_material_index = static_cast<uint16_t>(2 + material_id);
 
 		// CUSTOM streams give the model surface the same vertex format as the smooth surface,
 		// so one material_override (the default LOD shader) renders them all. Layout depends on
@@ -889,6 +966,9 @@ void VoxelMesherHybrid::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_terrain_material", "material"), &Self::set_terrain_material);
 	ClassDB::bind_method(D_METHOD("get_terrain_material"), &Self::get_terrain_material);
 
+	ClassDB::bind_method(D_METHOD("set_water_material", "material"), &Self::set_water_material);
+	ClassDB::bind_method(D_METHOD("get_water_material"), &Self::get_water_material);
+
 	ClassDB::bind_method(D_METHOD("set_model_material", "material"), &Self::set_model_material);
 	ClassDB::bind_method(D_METHOD("get_model_material"), &Self::get_model_material);
 
@@ -929,6 +1009,13 @@ void VoxelMesherHybrid::_bind_methods() {
 			),
 			"set_terrain_material",
 			"get_terrain_material"
+	);
+	ADD_PROPERTY(
+			PropertyInfo(
+					Variant::OBJECT, "water_material", PROPERTY_HINT_RESOURCE_TYPE, "Material"
+			),
+			"set_water_material",
+			"get_water_material"
 	);
 	ADD_PROPERTY(
 			PropertyInfo(

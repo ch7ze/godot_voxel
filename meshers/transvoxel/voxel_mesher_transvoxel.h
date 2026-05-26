@@ -1,6 +1,7 @@
 #ifndef VOXEL_MESHER_TRANSVOXEL_H
 #define VOXEL_MESHER_TRANSVOXEL_H
 
+#include "../../storage/voxel_buffer_gd.h"
 #include "../../util/macros.h"
 #include "../voxel_mesher.h"
 #include "transvoxel.h"
@@ -9,10 +10,6 @@ ZN_GODOT_FORWARD_DECLARE(class ArrayMesh);
 ZN_GODOT_FORWARD_DECLARE(class ShaderMaterial);
 
 namespace zylann::voxel {
-
-namespace godot {
-class VoxelBuffer;
-}
 
 class VoxelMesherTransvoxel : public VoxelMesher {
 	GDCLASS(VoxelMesherTransvoxel, VoxelMesher)
@@ -57,6 +54,20 @@ public:
 
 	void set_edge_clamp_margin(float margin);
 	float get_edge_clamp_margin() const;
+
+	// Channel the SDF is read from. Default CHANNEL_SDF matches the historical behavior;
+	// VoxelMesherHybrid uses this to mesh a second iso-surface from a different channel
+	// (e.g. CHANNEL_DATA5 for fluid volumes) without duplicating the Transvoxel code path.
+	void set_sdf_channel(VoxelBuffer::ChannelId channel);
+	VoxelBuffer::ChannelId get_sdf_channel() const;
+
+private:
+	// Variant-bindable wrappers around set/get_sdf_channel: VARIANT_ENUM_CAST is registered
+	// only for the godot::VoxelBuffer::ChannelId alias, so ClassDB::bind_method must accept
+	// that namespaced type and forward to the internal one. Mirrors VoxelTool::_b_set_channel.
+	void _b_set_sdf_channel(godot::VoxelBuffer::ChannelId p_channel);
+	godot::VoxelBuffer::ChannelId _b_get_sdf_channel() const;
+public:
 
 	Ref<ShaderMaterial> get_default_lod_material() const override;
 
@@ -104,6 +115,11 @@ private:
 	bool _transitions_enabled = true;
 
 	bool _textures_ignore_air_voxels = false;
+
+	// SDF source channel. CHANNEL_SDF preserves the historical single-channel meshing path;
+	// a second VoxelMesherTransvoxel instance configured with CHANNEL_DATA5 is used by
+	// VoxelMesherHybrid to mesh a separate fluid iso-surface from the same buffer.
+	VoxelBuffer::ChannelId _sdf_channel = VoxelBuffer::CHANNEL_SDF;
 };
 
 } // namespace zylann::voxel

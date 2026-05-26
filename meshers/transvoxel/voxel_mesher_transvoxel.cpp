@@ -68,7 +68,7 @@ VoxelMesherTransvoxel::VoxelMesherTransvoxel() {
 VoxelMesherTransvoxel::~VoxelMesherTransvoxel() {}
 
 int VoxelMesherTransvoxel::get_used_channels_mask() const {
-	uint32_t mask = 1 << VoxelBuffer::CHANNEL_SDF;
+	uint32_t mask = 1 << _sdf_channel;
 
 	switch (_texture_mode) {
 		case TEXTURES_NONE:
@@ -285,7 +285,7 @@ void VoxelMesherTransvoxel::build(VoxelMesher::Output &output, const VoxelMesher
 	// static thread_local FixedArray<transvoxel::MeshArrays, Cube::SIDE_COUNT> tls_transition_mesh_arrays;
 	static thread_local transvoxel::MeshArrays tls_simplified_mesh_arrays;
 
-	const VoxelBuffer::ChannelId sdf_channel = VoxelBuffer::CHANNEL_SDF;
+	const VoxelBuffer::ChannelId sdf_channel = _sdf_channel;
 
 	// Initialize dynamic memory:
 	// These vectors are re-used.
@@ -408,7 +408,7 @@ Ref<ArrayMesh> VoxelMesherTransvoxel::build_transition_mesh(Ref<godot::VoxelBuff
 
 	ERR_FAIL_COND_V(voxels.is_null(), Ref<ArrayMesh>());
 
-	if (voxels->is_uniform(VoxelBuffer::CHANNEL_SDF)) {
+	if (voxels->is_uniform(_sdf_channel)) {
 		// Uniform SDF won't produce any surface
 		return Ref<ArrayMesh>();
 	}
@@ -419,7 +419,7 @@ Ref<ArrayMesh> VoxelMesherTransvoxel::build_transition_mesh(Ref<godot::VoxelBuff
 	default_texture_indices_data.use = false;
 	transvoxel::build_transition_mesh(
 			voxels->get_buffer(),
-			VoxelBuffer::CHANNEL_SDF,
+			_sdf_channel,
 			direction,
 			0,
 			static_cast<transvoxel::TexturingMode>(_texture_mode),
@@ -507,6 +507,26 @@ float VoxelMesherTransvoxel::get_edge_clamp_margin() const {
 	return _edge_clamp_margin;
 }
 
+void VoxelMesherTransvoxel::set_sdf_channel(VoxelBuffer::ChannelId channel) {
+	ZN_ASSERT_RETURN(channel >= 0 && channel < VoxelBuffer::MAX_CHANNELS);
+	if (channel != _sdf_channel) {
+		_sdf_channel = channel;
+		emit_changed();
+	}
+}
+
+VoxelBuffer::ChannelId VoxelMesherTransvoxel::get_sdf_channel() const {
+	return _sdf_channel;
+}
+
+void VoxelMesherTransvoxel::_b_set_sdf_channel(godot::VoxelBuffer::ChannelId p_channel) {
+	set_sdf_channel(VoxelBuffer::ChannelId(p_channel));
+}
+
+godot::VoxelBuffer::ChannelId VoxelMesherTransvoxel::_b_get_sdf_channel() const {
+	return godot::VoxelBuffer::ChannelId(get_sdf_channel());
+}
+
 void VoxelMesherTransvoxel::_bind_methods() {
 	using Self = VoxelMesherTransvoxel;
 
@@ -538,6 +558,9 @@ void VoxelMesherTransvoxel::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_edge_clamp_margin"), &Self::get_edge_clamp_margin);
 	ClassDB::bind_method(D_METHOD("set_edge_clamp_margin", "margin"), &Self::set_edge_clamp_margin);
+
+	ClassDB::bind_method(D_METHOD("set_sdf_channel", "channel"), &Self::_b_set_sdf_channel);
+	ClassDB::bind_method(D_METHOD("get_sdf_channel"), &Self::_b_get_sdf_channel);
 
 	ADD_GROUP("Materials", "");
 
