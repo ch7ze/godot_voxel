@@ -13,6 +13,13 @@ public:
 	void set_channel_depth(const VoxelBuffer::ChannelId channel_index, const VoxelBuffer::Depth depth);
 	VoxelBuffer::Depth get_channel_depth(const VoxelBuffer::ChannelId channel_index) const;
 
+	// Channels that should be treated as SDF (Q16/Q8 sign-normalized encoding) in addition
+	// to the implicit CHANNEL_SDF. Typical use: opt CHANNEL_DATA5..DATA7 into the SDF
+	// pipeline so that VoxelData::get_voxel returns a properly decoded float instead of
+	// the raw uint reinterpreted as float. See voxel_format.h::is_channel_acting_as_sdf.
+	void set_channel_acting_as_sdf(const VoxelBuffer::ChannelId channel_index, const bool enable);
+	bool is_channel_acting_as_sdf(const VoxelBuffer::ChannelId channel_index) const;
+
 	void configure_buffer(Ref<VoxelBuffer> buffer) const;
 	Ref<VoxelBuffer> create_buffer(const Vector3i size) const;
 

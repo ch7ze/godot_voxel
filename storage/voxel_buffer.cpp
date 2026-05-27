@@ -232,6 +232,28 @@ void VoxelBuffer::clear(const VoxelFormat *new_format) {
 	_channels[CHANNEL_DATA6].defval = 0;
 	_channels[CHANNEL_DATA7].defval = 0;
 
+	// Channels opted in as SDF via VoxelFormat::channels_acting_as_sdf get the SDF-air default
+	// (positive Q-encoded value) instead of plain 0. Without this, fresh voxels in a generic
+	// data channel sit exactly on the iso-surface (raw=0 -> SDF=0), and Transvoxel would mesh
+	// the surface through every untouched voxel. Iterating only over the DATA channels keeps
+	// the established defaults for TYPE/SDF/COLOR/INDICES/WEIGHTS unchanged.
+	//
+	// The mask is sourced first from the explicit format argument; if none is provided (the
+	// common case for internal temp-buffer allocations), it falls back to the mask stored on
+	// the buffer itself. This keeps the SDF defaults sticky across clear() calls so the same
+	// VoxelBuffer reused across operations keeps the air default after each reset.
+	const uint8_t sdf_mask = new_format != nullptr
+			? new_format->channels_acting_as_sdf
+			: _channels_acting_as_sdf;
+	if (sdf_mask != 0) {
+		for (unsigned int ci = CHANNEL_DATA5; ci <= CHANNEL_DATA7; ++ci) {
+			if ((sdf_mask & (uint8_t(1) << ci)) != 0) {
+				_channels[ci].defval = get_default_sdf_raw_value(_channels[ci].depth);
+			}
+		}
+	}
+	_channels_acting_as_sdf = sdf_mask;
+
 	_size = Vector3i();
 	clear_voxel_metadata();
 }

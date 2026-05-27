@@ -149,9 +149,13 @@ void VoxelData::set_full_load_completed(bool complete) {
 	_full_load_completed = complete;
 }
 
-inline VoxelSingleValue get_voxel_sv(VoxelBuffer &vb, Vector3i pos, unsigned int channel) {
+inline VoxelSingleValue get_voxel_sv(
+		VoxelBuffer &vb, Vector3i pos, unsigned int channel, const bool channel_is_sdf) {
 	VoxelSingleValue v;
-	if (channel == VoxelBuffer::CHANNEL_SDF) {
+	if (channel_is_sdf) {
+		// SDF-encoded channels (CHANNEL_SDF or any data channel opted in via
+		// VoxelFormat::channels_acting_as_sdf) need the Q-decoding path; returning the raw
+		// uint in v.i would make script-side get_voxel_f reinterpret the raw bits as float.
 		v.f = vb.get_voxel_f(pos.x, pos.y, pos.z, channel);
 	} else {
 		v.i = vb.get_voxel(pos, channel);
@@ -200,7 +204,8 @@ VoxelSingleValue VoxelData::get_voxel(Vector3i pos, unsigned int channel_index, 
 			}
 		} else {
 			const Vector3i rpos = data_lod0.map.to_local(pos);
-			const VoxelSingleValue sv = get_voxel_sv(*voxels, rpos, channel_index);
+			const bool sdf_like = _format.is_channel_acting_as_sdf(static_cast<VoxelBuffer::ChannelId>(channel_index));
+			const VoxelSingleValue sv = get_voxel_sv(*voxels, rpos, channel_index, sdf_like);
 			data_lod0.spatial_lock.unlock_read(BoxBounds3i::from_position(block_pos));
 			return sv;
 		}
@@ -222,7 +227,8 @@ VoxelSingleValue VoxelData::get_voxel(Vector3i pos, unsigned int channel_index, 
 			std::shared_ptr<VoxelBuffer> voxels = try_get_voxel_buffer_with_lock(data_lod, block_pos, generate);
 
 			if (voxels != nullptr) {
-				const VoxelSingleValue sv = get_voxel_sv(*voxels, data_lod.map.to_local(voxel_pos), channel_index);
+				const bool sdf_like = _format.is_channel_acting_as_sdf(static_cast<VoxelBuffer::ChannelId>(channel_index));
+				const VoxelSingleValue sv = get_voxel_sv(*voxels, data_lod.map.to_local(voxel_pos), channel_index, sdf_like);
 				data_lod.spatial_lock.unlock_read(BoxBounds3i::from_position(block_pos));
 				return sv;
 

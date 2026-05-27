@@ -2172,25 +2172,29 @@ void VoxelLodTerrain::apply_mesh_update(VoxelEngine::BlockMeshOutput &ob) {
 				assign_material_after_mesh = true;
 			}
 
-			// Allocate a per-block water ShaderMaterial when the game has assigned one. The
-			// allocation is conditional on the block actually needing a water mesh; checking
-			// water_mesh.is_valid() defers the question until after the mesh is built.
-			if (_water_shader_material_pool.get_template().is_valid()
-				&& block->get_water_shader_material().is_null()
-				&& water_mesh.is_valid()) {
-				ZN_PROFILE_SCOPE_NAMED("Add water ShaderMaterial");
-				Ref<ShaderMaterial> wsm = _water_shader_material_pool.allocate();
-				if (wsm.is_valid() && _material_uses_lod_info) {
-					const int lod_count = get_lod_count();
-					wsm->set_shader_parameter(
-							VoxelStringNames::get_singleton().u_voxel_lod_info,
-							encode_lod_info_for_shader_uniform(ob.lod, lod_count)
-					);
-				}
-				block->set_water_shader_material(wsm);
-			}
-
 			block->set_transition_mask(transition_mask);
+		}
+
+		// Allocate a per-block water ShaderMaterial when the game has assigned one and the
+		// block actually has water this update. Must run on EVERY mesh update, not only on
+		// first block setup -- a block can start water-free (no water mesh, no water
+		// material) and gain water later via edits. Without this, late water edits would
+		// render with Godot's default white material because get_material_by_index for the
+		// fluid surface returns null when the mesher's own _water_material is unset (game
+		// drives the water material through terrain.water_material now).
+		if (water_mesh.is_valid()
+			&& _water_shader_material_pool.get_template().is_valid()
+			&& block->get_water_shader_material().is_null()) {
+			ZN_PROFILE_SCOPE_NAMED("Add water ShaderMaterial");
+			Ref<ShaderMaterial> wsm = _water_shader_material_pool.allocate();
+			if (wsm.is_valid() && _material_uses_lod_info) {
+				const int lod_count = get_lod_count();
+				wsm->set_shader_parameter(
+						VoxelStringNames::get_singleton().u_voxel_lod_info,
+						encode_lod_info_for_shader_uniform(ob.lod, lod_count)
+				);
+			}
+			block->set_water_shader_material(wsm);
 		}
 
 #ifdef TOOLS_ENABLED

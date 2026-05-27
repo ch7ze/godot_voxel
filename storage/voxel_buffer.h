@@ -629,6 +629,10 @@ private:
 	// The default is the least likely to be misused, though not necessarily the fastest.
 	Allocator _allocator = ALLOCATOR_DEFAULT;
 
+	// Mirror of VoxelFormat::channels_acting_as_sdf, kept on the buffer so clear() can
+	// pick the right defval even when called without an explicit format argument.
+	uint8_t _channels_acting_as_sdf = 0;
+
 	// TODO Could we separate metadata from VoxelBuffer?
 	VoxelMetadata _block_metadata;
 	// This metadata is expected to be sparse, with low amount of items.

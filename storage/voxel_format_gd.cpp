@@ -40,6 +40,28 @@ VoxelBuffer::Depth VoxelFormat::get_channel_depth(const VoxelBuffer::ChannelId c
 	return static_cast<VoxelBuffer::Depth>(_internal.depths[channel_index]);
 }
 
+void VoxelFormat::set_channel_acting_as_sdf(const VoxelBuffer::ChannelId channel_index, const bool enable) {
+	ZN_ASSERT_RETURN(channel_index >= 0 && channel_index < VoxelBuffer::MAX_CHANNELS);
+	// CHANNEL_SDF is always SDF -- silently ignore explicit toggling on it (the mask stays
+	// 0 there; is_channel_acting_as_sdf short-circuits before reading the mask anyway).
+	if (channel_index == VoxelBuffer::CHANNEL_SDF) {
+		return;
+	}
+	const uint8_t bit = uint8_t(1) << channel_index;
+	if (enable) {
+		_internal.channels_acting_as_sdf |= bit;
+	} else {
+		_internal.channels_acting_as_sdf &= ~bit;
+	}
+}
+
+bool VoxelFormat::is_channel_acting_as_sdf(const VoxelBuffer::ChannelId channel_index) const {
+	ZN_ASSERT_RETURN_V(channel_index >= 0 && channel_index < VoxelBuffer::MAX_CHANNELS, false);
+	// Bridge from godot::VoxelBuffer::ChannelId (GD-binding enum) to the internal
+	// zylann::voxel::VoxelBuffer::ChannelId enum -- they share the integer values.
+	return _internal.is_channel_acting_as_sdf(static_cast<zylann::voxel::VoxelBuffer::ChannelId>(channel_index));
+}
+
 void VoxelFormat::configure_buffer(Ref<VoxelBuffer> buffer) const {
 	ZN_ASSERT_RETURN(buffer.is_valid());
 	_internal.configure_buffer(buffer->get_buffer());
@@ -85,6 +107,15 @@ Array VoxelFormat::_b_get_data() const {
 void VoxelFormat::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_channel_depth", "channel_index", "depth"), &VoxelFormat::set_channel_depth);
 	ClassDB::bind_method(D_METHOD("get_channel_depth", "channel_index"), &VoxelFormat::get_channel_depth);
+
+	ClassDB::bind_method(
+			D_METHOD("set_channel_acting_as_sdf", "channel_index", "enable"),
+			&VoxelFormat::set_channel_acting_as_sdf
+	);
+	ClassDB::bind_method(
+			D_METHOD("is_channel_acting_as_sdf", "channel_index"),
+			&VoxelFormat::is_channel_acting_as_sdf
+	);
 
 	ClassDB::bind_method(D_METHOD("configure_buffer", "buffer"), &VoxelFormat::configure_buffer);
 	ClassDB::bind_method(D_METHOD("create_buffer", "size"), &VoxelFormat::create_buffer);
