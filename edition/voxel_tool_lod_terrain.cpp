@@ -415,6 +415,59 @@ int VoxelToolLodTerrain::do_sphere_add_with_material(Vector3 center, float radiu
 	return filled_count;
 }
 
+void VoxelToolLodTerrain::paint_voxels_material(PackedVector3Array positions, int material_index) {
+	ZN_PROFILE_SCOPE();
+	ERR_FAIL_COND(_terrain == nullptr);
+	ERR_FAIL_COND(material_index < 0 || material_index >= 16);
+	if (positions.size() == 0) {
+		return;
+	}
+
+	// Bounding box over all positions, so a single pre_generate / _post_edit covers them.
+	Vector3i min_pos(
+			Math::floor(positions[0].x), Math::floor(positions[0].y), Math::floor(positions[0].z)
+	);
+	Vector3i max_pos = min_pos;
+	for (int i = 0; i < positions.size(); ++i) {
+		const Vector3i p(Math::floor(positions[i].x), Math::floor(positions[i].y), Math::floor(positions[i].z));
+		min_pos = min_pos.min(p);
+		max_pos = max_pos.max(p);
+	}
+
+	const Box3i box = Box3i::from_min_max(min_pos, max_pos + Vector3i(1, 1, 1)).clipped(_terrain->get_voxel_bounds());
+	if (!is_area_editable(box)) {
+		ZN_PRINT_WARNING("Area not editable");
+		return;
+	}
+
+	VoxelData &data = _terrain->get_storage();
+	data.pre_generate_box(box);
+
+	VoxelSingleValue indices_default;
+	indices_default.i = 0;
+	VoxelSingleValue weights_default;
+	weights_default.i = 0;
+
+	for (int i = 0; i < positions.size(); ++i) {
+		const Vector3i pos(
+				Math::floor(positions[i].x), Math::floor(positions[i].y), Math::floor(positions[i].z)
+		);
+		uint16_t encoded_indices =
+				static_cast<uint16_t>(data.get_voxel(pos, VoxelBuffer::CHANNEL_INDICES, indices_default).i);
+		uint16_t encoded_weights =
+				static_cast<uint16_t>(data.get_voxel(pos, VoxelBuffer::CHANNEL_WEIGHTS, weights_default).i);
+
+		// Reuse the engine's Mixel4 blending so the painted material drops into the lowest-weight
+		// slot and weights stay normalized -- same logic the sphere/box texture-paint path uses.
+		mixel4::blend_texture_packed_u16(material_index, 1.0f, encoded_indices, encoded_weights);
+
+		data.try_set_voxel(encoded_indices, pos, VoxelBuffer::CHANNEL_INDICES);
+		data.try_set_voxel(encoded_weights, pos, VoxelBuffer::CHANNEL_WEIGHTS);
+	}
+
+	_post_edit(box.padded(2));
+}
+
 // Shared pipeline for the fluid-channel sphere edits. Identical to do_sphere() but with the
 // channel hardcoded to CHANNEL_DATA5 and the mode passed in, so the public methods do not
 // depend on VoxelTool::set_channel / set_mode state and cannot accidentally write to the
@@ -916,6 +969,10 @@ void VoxelToolLodTerrain::_bind_methods() {
 	ClassDB::bind_method(
 			D_METHOD("do_sphere_add_with_material", "center", "radius", "material_index"),
 			&Self::do_sphere_add_with_material
+	);
+	ClassDB::bind_method(
+			D_METHOD("paint_voxels_material", "positions", "material_index"),
+			&Self::paint_voxels_material
 	);
 	ClassDB::bind_method(
 			D_METHOD("do_sphere_fluid_add", "center", "radius"), &Self::do_sphere_fluid_add

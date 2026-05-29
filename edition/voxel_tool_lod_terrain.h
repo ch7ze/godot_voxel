@@ -61,6 +61,14 @@ public:
 	// Returns the number of newly filled voxels (useful for inventory accounting).
 	int do_sphere_add_with_material(Vector3 center, float radius, int material_index);
 
+	// Blends a Mixel4 material into the CHANNEL_INDICES/WEIGHTS of the given individual voxels at
+	// full weight, WITHOUT touching the SDF (the shape is unchanged). Unlike do_box with
+	// MODE_TEXTURE_PAINT -- whose blend weight follows the box-SDF and is 0 at a single cell --
+	// this paints exactly the listed voxels, so a caller can mark just the border voxels of a
+	// region (never a filled area). One _post_edit covers the bounding box of all positions.
+	// positions are voxel indices. material_index is a Mixel4 index (0..15).
+	void paint_voxels_material(PackedVector3Array positions, int material_index);
+
 	// Fluid sphere edits on CHANNEL_DATA5 (the smooth water iso-surface read by
 	// VoxelMesherHybrid's fluid Transvoxel pass). Independent from the terrain SDF -- the two
 	// volumes coexist on the same voxel grid but never overwrite each other.
