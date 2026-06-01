@@ -425,6 +425,72 @@ struct SdfAxisAlignedBox {
 
 Box3i get_round_cone_int_bounds(Vector3f p0, Vector3f p1, float r0, float r1);
 
+// SDF of a flat slab segment: a road-like strip running from a to b. Width (half_width) is the
+// horizontal half-extent measured as distance to the segment in the XZ plane (so it works for any
+// segment direction, unlike an axis-aligned box). Height (half_height) is the vertical half-extent
+// around plane_y. The slab is rounded at the segment ends in XZ (capsule-like footprint) but FLAT
+// on top and bottom -- the shape a road wants, instead of the round tube do_path/round-cone makes.
+//
+// Distance: combine the 2D (XZ) distance to the segment with the 1D (Y) distance to the slab's
+// vertical band, the standard SDF "extrude/intersect" via max(): a point is inside only when it is
+// both within half_width of the segment in XZ AND within half_height of plane_y.
+struct SdfFlatPathSegment {
+	Vector3f a; // segment start (world/local voxel space)
+	Vector3f b; // segment end
+	float half_width; // XZ half-extent (road half-width)
+	float half_height; // Y half-extent (half the slab thickness)
+	float plane_y; // Y center of the slab
+	float sdf_scale;
+
+	inline float dist_xz(Vector3f pos) const {
+		// Closest point on segment a..b, projected to XZ (ignore Y so the slab is horizontal).
+		const float ax = a.x, az = a.z;
+		const float bx = b.x, bz = b.z;
+		const float pax = pos.x - ax, paz = pos.z - az;
+		const float bax = bx - ax, baz = bz - az;
+		const float ba_len2 = bax * bax + baz * baz;
+		float t = 0.f;
+		if (ba_len2 > 1e-12f) {
+			t = (pax * bax + paz * baz) / ba_len2;
+			t = math::clamp(t, 0.f, 1.f);
+		}
+		const float dx = pax - bax * t;
+		const float dz = paz - baz * t;
+		return Math::sqrt(dx * dx + dz * dz);
+	}
+
+	inline float operator()(Vector3f pos) const {
+		const float d_xz = dist_xz(pos) - half_width;
+		const float d_y = Math::abs(pos.y - plane_y) - half_height;
+		// SDF of the intersection of the XZ disc-swept strip and the Y band.
+		// Exterior distance = length(max(d,0)); interior = min(max(d_xz,d_y), 0). Standard box-style
+		// combine, giving correct rounded-outside / sharp-edge behavior.
+		const float ox = math::max(d_xz, 0.f);
+		const float oy = math::max(d_y, 0.f);
+		const float outside = Math::sqrt(ox * ox + oy * oy);
+		const float inside = math::min(math::max(d_xz, d_y), 0.f);
+		return sdf_scale * (outside + inside);
+	}
+
+	inline bool is_inside(Vector3f pos) const {
+		return (*this)(pos) < 0.f;
+	}
+
+	inline Box3i get_box() const {
+		const float minx = math::min(a.x, b.x) - half_width;
+		const float maxx = math::max(a.x, b.x) + half_width;
+		const float minz = math::min(a.z, b.z) - half_width;
+		const float maxz = math::max(a.z, b.z) + half_width;
+		const float miny = plane_y - half_height;
+		const float maxy = plane_y + half_height;
+		return Box3i::from_min_max(
+					   math::floor_to_int(Vector3f(minx, miny, minz)),
+					   math::ceil_to_int(Vector3f(maxx, maxy, maxz))
+		)
+				.padded(2);
+	}
+};
+
 struct SdfRoundCone {
 	math::SdfRoundConePrecalc<float> cone;
 	float sdf_scale;

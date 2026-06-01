@@ -8,6 +8,7 @@
 #include "transvoxel_materials_mixel4.h"
 #include "transvoxel_materials_null.h"
 #include "transvoxel_materials_single_s4.h"
+#include "transvoxel_road.h"
 #include "transvoxel_tables.cpp"
 
 // Quality isn't great so not available for now.
@@ -1164,6 +1165,79 @@ StdVector<uint8_t> &get_tls_u8_conversion_buffer() {
 	return tls_conversion_backing_buffer;
 }
 
+StdVector<float> &get_tls_road_backing_buffer_f32() {
+	thread_local StdVector<float> tls_road_backing_buffer_f32;
+	return tls_road_backing_buffer_f32;
+}
+
+// Reads the optional road channel (an SDF channel like CHANNEL_DATA6) for the whole block and
+// converts every voxel to a float distance via sdf_as_float, into a thread-local buffer. Returns an
+// empty span when no road channel is configured (road_channel < 0) -- the RoadSampler then stays
+// inactive and meshing is unchanged. Depth-dispatched like the main SDF channel so 8/16/32-bit road
+// data all work.
+Span<const float> get_road_channel_as_float(const VoxelBuffer &voxels, const int road_channel) {
+	if (road_channel < 0) {
+		return Span<const float>();
+	}
+	const unsigned int channel = static_cast<unsigned int>(road_channel);
+	const unsigned int voxel_count = Vector3iUtil::get_volume_u64(voxels.get_size());
+	StdVector<float> &dst = get_tls_road_backing_buffer_f32();
+	dst.resize(voxel_count);
+
+	if (voxels.get_channel_compression(channel) == VoxelBuffer::COMPRESSION_UNIFORM) {
+		// Uniform block: one value for all voxels. The overwhelmingly common case is a road-free
+		// block, whose road SDF is uniformly positive (outside). Return an EMPTY span there so the
+		// RoadSampler stays inactive: no per-vertex road_data is produced, and the hybrid mesher
+		// fills a single constant inert CUSTOM3 per surface instead. This keeps road meshing nearly
+		// free for the vast majority of blocks even though the road channel is globally enabled.
+		// A uniform block that is entirely inside a road (negative) is meshed normally.
+		float v = 0.f;
+		switch (voxels.get_channel_depth(channel)) {
+			case VoxelBuffer::DEPTH_8_BIT:
+				v = sdf_as_float(static_cast<int8_t>(voxels.get_voxel(Vector3i(), channel)));
+				break;
+			case VoxelBuffer::DEPTH_16_BIT:
+				v = sdf_as_float(static_cast<int16_t>(voxels.get_voxel(Vector3i(), channel)));
+				break;
+			default:
+				v = 1.f; // unsupported depth: treat as "outside road"
+				break;
+		}
+		if (v >= 0.f) {
+			// Entirely outside any road: inactive (empty span).
+			return Span<const float>();
+		}
+		for (unsigned int i = 0; i < voxel_count; ++i) {
+			dst[i] = v;
+		}
+		return to_span_const(dst);
+	}
+
+	Span<const uint8_t> raw;
+	ZN_ASSERT_RETURN_V(voxels.get_channel_as_bytes_read_only(channel, raw) == true, Span<const float>());
+	switch (voxels.get_channel_depth(channel)) {
+		case VoxelBuffer::DEPTH_8_BIT: {
+			Span<const int8_t> s = raw.reinterpret_cast_to<const int8_t>();
+			for (unsigned int i = 0; i < voxel_count; ++i) {
+				dst[i] = sdf_as_float(s[i]);
+			}
+		} break;
+		case VoxelBuffer::DEPTH_16_BIT: {
+			Span<const int16_t> s = raw.reinterpret_cast_to<const int16_t>();
+			for (unsigned int i = 0; i < voxel_count; ++i) {
+				dst[i] = sdf_as_float(s[i]);
+			}
+		} break;
+		default:
+			// Unsupported depth: treat the whole block as "outside road".
+			for (unsigned int i = 0; i < voxel_count; ++i) {
+				dst[i] = 1.f;
+			}
+			break;
+	}
+	return to_span_const(dst);
+}
+
 template <typename TMaterialProcessor>
 inline void build_regular_mesh_dispatch_sd(
 		const VoxelBuffer &voxels,
@@ -1250,7 +1324,8 @@ DefaultTextureIndicesData build_regular_mesh(
 		MeshArrays &output,
 		StdVector<CellInfo> *cell_infos,
 		const float edge_clamp_margin,
-		const bool textures_ignore_air_voxels
+		const bool textures_ignore_air_voxels,
+		const int road_channel
 ) {
 	ZN_PROFILE_SCOPE();
 	// From this point, we expect the buffer to contain allocated data in the relevant channels.
@@ -1262,12 +1337,17 @@ DefaultTextureIndicesData build_regular_mesh(
 	DefaultTextureIndicesData default_texture_indices;
 	default_texture_indices.use = false;
 
+	// Optional per-vertex road scalar source. Empty span when no road channel is configured (or the
+	// block is entirely outside any road), which leaves the RoadSampler inactive and the meshing
+	// byte-identical to before.
+	const Span<const float> road_data = get_road_channel_as_float(voxels, road_channel);
+
 	switch (texturing_mode) {
 		case TEXTURES_NONE:
 			build_regular_mesh_dispatch_sd(
 					voxels,
 					sdf_channel,
-					materials::NullProcessor{},
+					materials::NullProcessorT<8>(road::RoadSampler<8>(road_data, output.road_data)),
 					lod_index,
 					cache,
 					output,
@@ -1302,7 +1382,8 @@ DefaultTextureIndicesData build_regular_mesh(
 							voxel_material_indices,
 							voxel_material_weights,
 							output.texturing_data_2f32,
-							textures_ignore_air_voxels
+							textures_ignore_air_voxels,
+							road::RoadSampler<8>(road_data, output.road_data)
 					),
 					lod_index,
 					cache,
@@ -1442,19 +1523,26 @@ void build_transition_mesh(
 		MeshArrays &output,
 		DefaultTextureIndicesData default_texture_indices_data,
 		const float edge_clamp_margin,
-		const bool textures_ignore_air_voxels
+		const bool textures_ignore_air_voxels,
+		const int road_channel
 ) {
 	ZN_PROFILE_SCOPE();
 	// From this point, we expect the buffer to contain allocated data in the relevant channels.
 
 	const unsigned int voxels_count = Vector3iUtil::get_volume_u64(voxels.get_size());
 
+	// Same road source as the regular pass (same block -> same active/inactive result, so the two
+	// passes stay in lockstep). The transition pass appends to the SAME output.road_data after the
+	// regular pass, so the road stream must stay in lockstep (one float per vertex) here too,
+	// otherwise ARRAY_CUSTOM3 would be shorter than the vertex array.
+	const Span<const float> road_data = get_road_channel_as_float(voxels, road_channel);
+
 	switch (texturing_mode) {
 		case TEXTURES_NONE:
 			build_transition_mesh_dispatch_sd(
 					voxels,
 					sdf_channel,
-					materials::NullProcessor{},
+					materials::NullProcessorT<13>(road::RoadSampler<13>(road_data, output.road_data)),
 					direction,
 					lod_index,
 					cache,
@@ -1490,7 +1578,11 @@ void build_transition_mesh(
 					voxels,
 					sdf_channel,
 					materials::mixel4::Processor<13>(
-							indices_data, weights_data, output.texturing_data_2f32, textures_ignore_air_voxels
+							indices_data,
+							weights_data,
+							output.texturing_data_2f32,
+							textures_ignore_air_voxels,
+							road::RoadSampler<13>(road_data, output.road_data)
 					),
 					direction,
 					lod_index,

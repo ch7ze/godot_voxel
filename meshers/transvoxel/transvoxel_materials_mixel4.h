@@ -6,6 +6,7 @@
 #include "../../util/containers/std_vector.h"
 #include "transvoxel.h"
 #include "transvoxel_materials_common.h"
+#include "transvoxel_road.h" // road::RoadSampler composed into the processor
 
 namespace zylann::voxel::transvoxel::materials::mixel4 {
 
@@ -195,17 +196,23 @@ struct Processor {
 	const bool textures_skip_air_voxels;
 	CellTextureDatas<NVoxels> cell_textures;
 	StdVector<Vector2f> &output_mesh_material_data;
+	// Optional per-vertex road scalar, composed in. Inactive (empty data) unless a road channel
+	// is configured; then it appends one float per vertex in lockstep with on_vertex, so the
+	// road stream stays aligned with the material/position streams.
+	road::RoadSampler<NVoxels> road;
 
 	Processor(
 			const TextureIndicesData p_voxel_material_indices,
 			const WeightSamplerPackedU16 p_voxel_material_weights,
 			StdVector<Vector2f> &p_output_mesh_material_data,
-			const bool p_textures_skip_air_voxels
+			const bool p_textures_skip_air_voxels,
+			const road::RoadSampler<NVoxels> p_road
 	) :
 			voxel_material_indices(p_voxel_material_indices),
 			voxel_material_weights(p_voxel_material_weights),
 			textures_skip_air_voxels(p_textures_skip_air_voxels),
-			output_mesh_material_data(p_output_mesh_material_data) {}
+			output_mesh_material_data(p_output_mesh_material_data),
+			road(p_road) {}
 
 	inline uint32_t on_cell(const FixedArray<uint32_t, NVoxels> &corner_voxel_indices, const uint8_t case_code) {
 		get_cell_texture_data(
@@ -215,6 +222,7 @@ struct Processor {
 				voxel_material_weights,
 				textures_skip_air_voxels ? case_code : 0
 		);
+		road.on_cell(corner_voxel_indices);
 
 		return cell_textures.packed_indices;
 	}
@@ -239,6 +247,8 @@ struct Processor {
 
 		fill_redundant_transition_cell_values(cell_textures_partial.weights, cell_textures.weights);
 
+		road.on_transition_cell(corner_voxel_indices);
+
 		return cell_textures.packed_indices;
 	}
 
@@ -250,6 +260,7 @@ struct Processor {
 			weights[i] = static_cast<uint8_t>(math::clamp(Math::lerp(weights0[i], weights1[i], alpha), 0.f, 255.f));
 		}
 		add_4i8_4w8_texture_data(output_mesh_material_data, cell_textures.packed_indices, weights);
+		road.on_vertex(v0, v1, alpha);
 	}
 };
 

@@ -139,6 +139,14 @@ PackedFloat32Array build_material_id_stream(int vertex_count, float material_id)
 	return stream;
 }
 
+// Per-vertex road scalar lives in CUSTOM3 (1 float). When the road channel is enabled, every
+// surface in the chunk must carry it (build_mesh applies one mesh_flags value to all surfaces).
+// Surfaces without real road data (models, water, terrain blocks with no road) get this inert
+// value, which is positive so the shader's sign test classifies them as "outside the road".
+constexpr float ROAD_OUTSIDE_VALUE = 1.0f;
+constexpr int HYBRID_CUSTOM_MESH_FLAG_ROAD =
+		(RenderingServerEnums::ARRAY_CUSTOM_R_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM3_SHIFT);
+
 // Builds an inert CUSTOM1 stream for model surfaces when texturing is enabled: Transvoxel's
 // shader expects 2 floats per vertex (packed indices + weights), but model surfaces have no
 // voxel-based material data. Zeros are written so the shader's texture sampler returns the
@@ -191,6 +199,11 @@ int VoxelMesherHybrid::get_used_channels_mask() const {
 		mask |= _fluid_transvoxel_mesher->get_used_channels_mask();
 	}
 	mask |= (1 << VoxelBuffer::CHANNEL_TYPE);
+	// The road distance-field channel is read per vertex during meshing, so it must be streamed in.
+	const int road_channel = _transvoxel_mesher->get_road_channel();
+	if (road_channel >= 0) {
+		mask |= (1 << road_channel);
+	}
 	return mask;
 }
 
@@ -252,6 +265,22 @@ bool VoxelMesherHybrid::get_textures_ignore_air_voxels() const {
 		return false;
 	}
 	return _transvoxel_mesher->get_textures_ignore_air_voxels();
+}
+
+void VoxelMesherHybrid::set_road_channel(int channel) {
+	ERR_FAIL_COND(_transvoxel_mesher.is_null());
+	_transvoxel_mesher->set_road_channel(channel);
+}
+
+int VoxelMesherHybrid::get_road_channel() const {
+	if (_transvoxel_mesher.is_null()) {
+		return -1;
+	}
+	return _transvoxel_mesher->get_road_channel();
+}
+
+bool VoxelMesherHybrid::is_road_enabled() const {
+	return _transvoxel_mesher.is_valid() && _transvoxel_mesher->get_road_channel() >= 0;
 }
 
 void VoxelMesherHybrid::set_terrain_material(Ref<Material> material) {
@@ -635,6 +664,16 @@ void VoxelMesherHybrid::build_fluid_surfaces(VoxelMesher::Output &output, const 
 		} else {
 			arrays[Mesh::ARRAY_CUSTOM1] = build_material_id_stream(vertices.size(), 1.0f);
 		}
+		// Road CUSTOM3 consistency: the fluid mesher runs without a road channel for now (water
+		// roads are a later step), so give water surfaces the inert "outside" value when the land
+		// road channel is enabled, matching the terrain/model format. A water surface that already
+		// carries CUSTOM3 (future water-road fluid mesher) is left untouched.
+		if (is_road_enabled()) {
+			const PackedFloat32Array existing = arrays[Mesh::ARRAY_CUSTOM3];
+			if (existing.size() != vertices.size()) {
+				arrays[Mesh::ARRAY_CUSTOM3] = build_material_id_stream(vertices.size(), ROAD_OUTSIDE_VALUE);
+			}
+		}
 		surface.material_index = 1;
 	}
 }
@@ -654,6 +693,8 @@ void VoxelMesherHybrid::finalize_terrain_surfaces(VoxelMesher::Output &output) c
 	// Without Transvoxel texturing, the material id goes into CUSTOM1 (1 float). With Transvoxel
 	// texturing (Mixel4 / Single), CUSTOM1 is already owned by Transvoxel's 2-float texture data
 	// (indices+weights), so the material id is written to CUSTOM2 instead.
+	const bool road_enabled = is_road_enabled();
+
 	for (VoxelMesher::Output::Surface &surface : output.surfaces) {
 		Array &arrays = surface.arrays;
 		if (arrays.size() < Mesh::ARRAY_MAX) {
@@ -669,6 +710,15 @@ void VoxelMesherHybrid::finalize_terrain_surfaces(VoxelMesher::Output &output) c
 		} else {
 			arrays[Mesh::ARRAY_CUSTOM1] = build_material_id_stream(vertices.size(), 0.0f);
 		}
+		// Road CUSTOM3: terrain surfaces that actually cross a road already carry it (written by the
+		// inner Transvoxel mesher). Surfaces without it (road-free terrain blocks) get the inert
+		// "outside" value so every surface has CUSTOM3 when the format declares it.
+		if (road_enabled) {
+			const PackedFloat32Array existing = arrays[Mesh::ARRAY_CUSTOM3];
+			if (existing.size() != vertices.size()) {
+				arrays[Mesh::ARRAY_CUSTOM3] = build_material_id_stream(vertices.size(), ROAD_OUTSIDE_VALUE);
+			}
+		}
 	}
 
 	// Declare the format of all custom streams. build_mesh() applies one mesh_flags value to
@@ -678,6 +728,9 @@ void VoxelMesherHybrid::finalize_terrain_surfaces(VoxelMesher::Output &output) c
 	// field would make Godot reject the model surface ("Invalid array format for surface").
 	output.mesh_flags |= texturing_enabled ? HYBRID_CUSTOM_MESH_FLAGS_TEXTURED
 										   : HYBRID_CUSTOM_MESH_FLAGS_NO_TEXTURING;
+	if (road_enabled) {
+		output.mesh_flags |= HYBRID_CUSTOM_MESH_FLAG_ROAD;
+	}
 }
 
 void VoxelMesherHybrid::promote_terrain_collision(VoxelMesher::Output &output) const {
@@ -969,6 +1022,11 @@ void VoxelMesherHybrid::build_model_surface(VoxelMesher::Output &output, const V
 			arrays[Mesh::ARRAY_CUSTOM1] =
 					build_material_id_stream(gd_positions.size(), static_cast<float>(surface_material_index));
 		}
+		// Models are never road: give them the inert "outside" CUSTOM3 so the format matches the
+		// terrain surfaces when the road channel is enabled.
+		if (is_road_enabled()) {
+			arrays[Mesh::ARRAY_CUSTOM3] = build_material_id_stream(gd_positions.size(), ROAD_OUTSIDE_VALUE);
+		}
 
 		output.surfaces.push_back({ arrays, surface_material_index });
 
@@ -1013,6 +1071,9 @@ void VoxelMesherHybrid::_bind_methods() {
 			D_METHOD("set_textures_ignore_air_voxels", "enabled"), &Self::set_textures_ignore_air_voxels
 	);
 	ClassDB::bind_method(D_METHOD("get_textures_ignore_air_voxels"), &Self::get_textures_ignore_air_voxels);
+
+	ClassDB::bind_method(D_METHOD("set_road_channel", "channel"), &Self::set_road_channel);
+	ClassDB::bind_method(D_METHOD("get_road_channel"), &Self::get_road_channel);
 
 	ADD_PROPERTY(
 			PropertyInfo(

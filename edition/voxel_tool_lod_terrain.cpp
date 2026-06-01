@@ -211,6 +211,69 @@ void VoxelToolLodTerrain::do_hemisphere(Vector3 center, float radius, Vector3 fl
 	_post_edit(op.box);
 }
 
+void VoxelToolLodTerrain::do_flat_path(PackedVector3Array positions, float half_width, float thickness) {
+	ZN_PROFILE_SCOPE();
+	ERR_FAIL_COND(_terrain == nullptr);
+	ERR_FAIL_COND(positions.size() < 2);
+
+	// World -> local, same convention as do_path: positions and the radius-like extents are scaled
+	// by the inverse terrain transform so node scaling (finer voxel resolution) does not break edits.
+	const Transform3D to_world = _terrain->get_global_transform();
+	const Transform3D to_local = to_world.affine_inverse();
+	const Vector3 scale = to_world.basis.get_scale();
+	const float scale_max = math::max(
+			math::max(Math::abs(scale.x), Math::abs(scale.y)), math::max(Math::abs(scale.z), 0.00001f));
+	const float half_width_local = half_width / scale_max;
+	const float half_height_local = (thickness * 0.5f) / scale_max;
+
+	const float sdf_scale = get_sdf_scale();
+	const ops::Mode mode = static_cast<ops::Mode>(get_mode());
+
+	// One chunked slab per segment. Each rasterizes independently (segments overlap at shared
+	// points, which is fine for SdfUnion/Subtract). _post_edit is called once per segment over its
+	// own box, matching how do_sphere/do_hemisphere report their edits.
+	const int64_t point_count = positions.size();
+	for (int64_t i = 1; i < point_count; ++i) {
+		const Vector3 p0w = to_local.xform(positions[i - 1]);
+		const Vector3 p1w = to_local.xform(positions[i]);
+
+		ops::DoShapeChunked<ops::SdfFlatPathSegment, ops::VoxelDataGridAccess> op;
+		op.shape.a = to_vec3f(p0w);
+		op.shape.b = to_vec3f(p1w);
+		op.shape.half_width = half_width_local;
+		op.shape.half_height = half_height_local;
+		// Slab vertical center: midpoint Y of the segment endpoints (the road follows the points'
+		// height). A short segment is essentially flat in Y, so a single plane_y is enough.
+		op.shape.plane_y = 0.5f * (static_cast<float>(p0w.y) + static_cast<float>(p1w.y));
+		op.shape.sdf_scale = sdf_scale;
+		op.box = op.shape.get_box().clipped(_terrain->get_voxel_bounds());
+		op.mode = mode;
+		op.texture_params = _texture_params;
+		op.blocky_value = _value;
+		op.channel = get_channel();
+		op.strength = get_sdf_strength();
+
+		if (!is_area_editable(op.box)) {
+			ZN_PRINT_WARNING("Area not editable");
+			continue;
+		}
+
+		VoxelData &data = _terrain->get_storage();
+		data.pre_generate_box(op.box);
+
+		VoxelDataGrid grid;
+		data.get_blocks_grid(grid, op.box, 0);
+		op.block_access.grid = &grid;
+
+		{
+			VoxelDataGrid::LockWrite wlock(grid);
+			op();
+		}
+
+		_post_edit(op.box);
+	}
+}
+
 void VoxelToolLodTerrain::do_path(Span<const Vector3> positions, Span<const float> radii) {
 	ZN_ASSERT_RETURN(_terrain != nullptr);
 	ZN_ASSERT_RETURN(positions.size() == radii.size());
@@ -988,6 +1051,9 @@ void VoxelToolLodTerrain::_bind_methods() {
 			D_METHOD("do_hemisphere", "center", "radius", "flat_direction", "smoothness"),
 			&Self::do_hemisphere,
 			DEFVAL(0.0)
+	);
+	ClassDB::bind_method(
+			D_METHOD("do_flat_path", "positions", "half_width", "thickness"), &Self::do_flat_path
 	);
 	ClassDB::bind_method(
 			D_METHOD("run_blocky_random_tick", "area", "voxel_count", "callback", "batch_count", "tags_mask"),

@@ -44,6 +44,13 @@ public:
 	void set_raycast_binary_search_iterations(int iterations);
 	void do_sphere_async(Vector3 center, float radius);
 	void do_hemisphere(Vector3 center, float radius, Vector3 flat_direction, float smoothness);
+	// Lays a FLAT slab strip along the polyline `positions` -- a road-like band of constant width
+	// and thickness, rounded at the segment ends in the horizontal plane but flat on top and bottom
+	// (unlike do_path, which makes a round tube). half_width is the horizontal half-extent, thickness
+	// the full vertical extent; the slab is centered vertically on each point's Y. The current mode
+	// (Add/Remove) and channel apply, like the other do_* edits. Used for roads (see
+	// VoxelEdits.BuildRoadPath). PackedVector3Array (not Span) so it binds directly to C#.
+	void do_flat_path(PackedVector3Array positions, float half_width, float thickness);
 	float get_voxel_f_interpolated(Vector3 position) const override;
 
 	// Counts solid voxels inside the SDF sphere and aggregates their dominant Mixel4 material.
