@@ -304,12 +304,21 @@ void convert_gpu_output_single_texture(VoxelBuffer &dst, Span<const float> src_d
 	const uint16_t encoded_weights = mixel4::make_encoded_weights_for_single_texture();
 	dst.fill_area(encoded_weights, box.position, box.position + box.size, VoxelBuffer::CHANNEL_WEIGHTS);
 
+	// NOTE: This VoxelGeneratorGraph GPU path was NOT migrated to the 256-material (32-bit, 8-bit-
+	// per-slot) index layout. It still writes a 16-bit index word (4-bit-per-slot, max 16 materials)
+	// and clamps the index to 0..15. This project does not use VoxelGeneratorGraph (it uses a C#
+	// VoxelGeneratorScript), so this path is dead code here and is left 16-bit to avoid touching the
+	// GPU index-generation pipeline. make_encoded_indices_for_single_texture now returns uint32_t, so
+	// the value is explicitly truncated to 16 bits to keep this legacy 4-bit-per-slot path compiling.
+	// If VoxelGeneratorGraph GPU generation is ever enabled, CHANNEL_INDICES must be forced to
+	// DEPTH_16_BIT for it, or this path rewritten to 32-bit indices.
 	// Little hack: the destination type is smaller than float, so we can convert in place.
 	Span<uint16_t> src_data_u16 = get_temporary_conversion_memory_tls<uint16_t>(src_data_f.size());
 
 	for (unsigned int value_index = 0; value_index < src_data_f.size(); ++value_index) {
 		const uint8_t index = math::clamp(int(Math::round(src_data_f[value_index])), 0, 15);
-		const uint16_t encoded_indices = mixel4::make_encoded_indices_for_single_texture(index);
+		const uint16_t encoded_indices =
+				static_cast<uint16_t>(mixel4::make_encoded_indices_for_single_texture(index) & 0xffff);
 		src_data_u16[value_index] = encoded_indices;
 	}
 

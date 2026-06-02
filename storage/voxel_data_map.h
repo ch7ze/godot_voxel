@@ -217,7 +217,8 @@ public:
 					const Vector3i block_origin = block_to_voxel(block_pos);
 					Box3i local_box(voxel_box.position - block_origin, voxel_box.size);
 					local_box.clip(Box3i(Vector3i(), block_size));
-					block->get_voxels().write_box_2_template<F, uint16_t, uint16_t>(
+					// write_box_2 is used for the Mixel4 texture paint (INDICES 32-bit, WEIGHTS 16-bit).
+					block->get_voxels().write_box_2_template<F, uint32_t, uint16_t>(
 							local_box, channel0, channel1, action, block_origin
 					);
 				}

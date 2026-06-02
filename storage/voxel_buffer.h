@@ -161,7 +161,9 @@ public:
 	static const Depth DEFAULT_CHANNEL_DEPTH = DEPTH_8_BIT;
 	static const Depth DEFAULT_TYPE_CHANNEL_DEPTH = DEPTH_16_BIT;
 	static const Depth DEFAULT_SDF_CHANNEL_DEPTH = DEPTH_16_BIT;
-	static const Depth DEFAULT_INDICES_CHANNEL_DEPTH = DEPTH_16_BIT;
+	// 32-bit so the Mixel4 index word can hold 4 slots x 8 bits = 256 distinct material indices
+	// (previously DEPTH_16_BIT = 4 slots x 4 bits = 16). Weights stay 16-bit (4 bits per slot).
+	static const Depth DEFAULT_INDICES_CHANNEL_DEPTH = DEPTH_32_BIT;
 	static const Depth DEFAULT_WEIGHTS_CHANNEL_DEPTH = DEPTH_16_BIT;
 
 	// Limit was made explicit for serialization reasons, and also because there must be a reasonable one

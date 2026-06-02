@@ -114,18 +114,7 @@ public:
 	void set_textures_ignore_air_voxels(bool enabled);
 	bool get_textures_ignore_air_voxels() const;
 
-	// Forwarded to the inner terrain Transvoxel mesher: the SDF channel sampled per vertex into
-	// CUSTOM3 as a "road" distance field (e.g. CHANNEL_DATA6), turned into a sharp material edge by
-	// the terrain shader. -1 disables it. The fluid mesher keeps its own road channel (default -1)
-	// for future water roads.
-	void set_road_channel(int channel);
-	int get_road_channel() const;
-
 private:
-	// True when the terrain road channel is configured (>= 0). Every surface in the chunk then has
-	// to carry CUSTOM3 (real road data on road-crossing terrain, inert "outside" elsewhere).
-	bool is_road_enabled() const;
-
 	// Builds the blocky model part into `output` (one surface per material).
 	// Also appends the model triangles to `output.collision_surface` so models are solid.
 	// No-op if no library is set.

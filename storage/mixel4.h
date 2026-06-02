@@ -37,18 +37,22 @@ inline FixedArray<uint8_t, 4> decode_weights_from_packed_u16(uint16_t packed_wei
 	return weights;
 }
 
-inline FixedArray<uint8_t, 4> decode_indices_from_packed_u16(uint16_t packed_indices) {
+// Indices are stored 8 bits per slot in a 32-bit word, allowing 256 distinct material indices
+// (0..255). The 4 blend slots per voxel are unchanged; only the per-slot bit width grew from 4
+// to 8 bits. The function name keeps the "u16" suffix for historical continuity of call sites,
+// but the packed value is now a uint32_t (CHANNEL_INDICES uses DEPTH_32_BIT). Weights stay 4 bits
+// per slot in a uint16_t (see decode_weights_from_packed_u16) -- their precision is untouched.
+inline FixedArray<uint8_t, 4> decode_indices_from_packed_u16(uint32_t packed_indices) {
 	FixedArray<uint8_t, 4> indices;
-	// SIMDable?
-	indices[0] = (packed_indices >> 0) & 0x0f;
-	indices[1] = (packed_indices >> 4) & 0x0f;
-	indices[2] = (packed_indices >> 8) & 0x0f;
-	indices[3] = (packed_indices >> 12) & 0x0f;
+	indices[0] = (packed_indices >> 0) & 0xff;
+	indices[1] = (packed_indices >> 8) & 0xff;
+	indices[2] = (packed_indices >> 16) & 0xff;
+	indices[3] = (packed_indices >> 24) & 0xff;
 	return indices;
 }
 
-inline constexpr uint16_t encode_indices_to_packed_u16(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
-	return (a & 0xf) | ((b & 0xf) << 4) | ((c & 0xf) << 8) | ((d & 0xf) << 12);
+inline constexpr uint32_t encode_indices_to_packed_u16(uint8_t a, uint8_t b, uint8_t c, uint8_t d) {
+	return (uint32_t(a) << 0) | (uint32_t(b) << 8) | (uint32_t(c) << 16) | (uint32_t(d) << 24);
 }
 
 // Encodes from 0..255 to 0..15 values packed in 16 bits. Lower 4 bits of input values will not be preserved.
@@ -122,8 +126,8 @@ inline void normalize_weights_preserving(FixedArray<float, 4> &weights, unsigned
 inline void blend_texture_packed_u16(
 		const int texture_index,
 		const float target_weight,
-		uint16_t &encoded_indices,
-		uint16_t &encoded_weights
+		uint32_t &encoded_indices, // 8-bit-per-slot index word (256 materials)
+		uint16_t &encoded_weights // 4-bit-per-slot weight word, unchanged
 ) {
 #ifdef DEBUG_ENABLED
 	ZN_ASSERT_RETURN(target_weight >= 0.f && target_weight <= 1.f);
@@ -184,13 +188,13 @@ constexpr inline uint16_t make_encoded_weights_for_single_texture() {
 	return encode_weights_to_packed_u16_lossy(255, 0, 0, 0);
 }
 
-constexpr inline uint16_t make_encoded_indices_for_single_texture(uint8_t index) {
+constexpr inline uint32_t make_encoded_indices_for_single_texture(uint8_t index) {
 	// Make sure other indices are different so the weights associated with them don't override the first
-	// index's weight.
-	const uint8_t index1 = (index + 1) & 0xf;
-	const uint8_t index2 = (index + 2) & 0xf;
-	const uint8_t index3 = (index + 3) & 0xf;
-	const uint16_t encoded_indices = encode_indices_to_packed_u16(index, index1, index2, index3);
+	// index's weight. 8-bit slots now, so the distinct fillers wrap at 256 instead of 16.
+	const uint8_t index1 = (index + 1) & 0xff;
+	const uint8_t index2 = (index + 2) & 0xff;
+	const uint8_t index3 = (index + 3) & 0xff;
+	const uint32_t encoded_indices = encode_indices_to_packed_u16(index, index1, index2, index3);
 	return encoded_indices;
 	// Note: an alternative would be to snap indices so that the first one is multiple of 4 and following ones are
 	// consecutive. That would minimize the changes in indices layout while keeping them sorted, which could in turn

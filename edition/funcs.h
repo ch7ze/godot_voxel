@@ -553,7 +553,8 @@ struct TextureBlendSphereOp {
 		tp = p_tp;
 	}
 
-	inline void operator()(Vector3i pos, uint16_t &indices, uint16_t &weights) const {
+	// indices is the 32-bit Mixel4 index word (8-bit-per-slot, 256 materials); weights stays 16-bit.
+	inline void operator()(Vector3i pos, uint32_t &indices, uint16_t &weights) const {
 		const float distance_squared = math::distance_squared(to_vec3f(pos), center);
 		// Avoiding square root on the hot path
 		if (distance_squared < radius_squared) {
@@ -570,7 +571,8 @@ struct TextureBlendOp {
 	Shape_T shape;
 	TextureParams texture_params;
 
-	inline void operator()(Vector3i pos, uint16_t &indices, uint16_t &weights) const {
+	// indices is the 32-bit Mixel4 index word (8-bit-per-slot, 256 materials); weights stays 16-bit.
+	inline void operator()(Vector3i pos, uint32_t &indices, uint16_t &weights) const {
 		const float sd = shape(to_vec3f(pos));
 		if (sd <= 0) {
 			// TODO We don't know the full size of the shape so sharpness may be adjusted
@@ -736,7 +738,8 @@ inline void write_box_in_chunked_storage_2_channels(
 			box,
 			block_access,
 			[&op, channel0_id, channel1_id](VoxelBuffer &vb, const Box3i local_box, Vector3i origin) {
-				vb.write_box_2_template<FOp, uint16_t, uint16_t>(local_box, channel0_id, channel1_id, op, origin);
+				// channel0 = CHANNEL_INDICES (32-bit, 256 materials), channel1 = CHANNEL_WEIGHTS (16-bit).
+				vb.write_box_2_template<FOp, uint32_t, uint16_t>(local_box, channel0_id, channel1_id, op, origin);
 			}
 	);
 }
@@ -860,7 +863,8 @@ struct DoShapeSingleBuffer {
 					TextureBlendOp<TShape> op;
 					op.shape = shape;
 					op.texture_params = texture_params;
-					buffer->write_box_2_template<TextureBlendOp<TShape>, uint16_t, uint16_t>(
+					// CHANNEL_INDICES is 32-bit (8-bit-per-slot, 256 materials); CHANNEL_WEIGHTS stays 16-bit.
+					buffer->write_box_2_template<TextureBlendOp<TShape>, uint32_t, uint16_t>(
 							box, VoxelBuffer::CHANNEL_INDICES, VoxelBuffer::CHANNEL_WEIGHTS, op, Vector3i()
 					);
 				} break;

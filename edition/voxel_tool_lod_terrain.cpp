@@ -212,11 +212,16 @@ void VoxelToolLodTerrain::do_hemisphere(Vector3 center, float radius, Vector3 fl
 }
 
 void VoxelToolLodTerrain::do_flat_path(
-		PackedVector3Array positions, float half_width, float thickness, float smoothness, int road_channel) {
+		PackedVector3Array positions, float half_width, float thickness, float smoothness,
+		int material_index) {
 	ZN_PROFILE_SCOPE();
 	ERR_FAIL_COND(_terrain == nullptr);
 	ERR_FAIL_COND(positions.size() < 2);
-	ERR_FAIL_COND(road_channel >= 0 && road_channel >= VoxelBuffer::MAX_CHANNELS);
+	// material_index < 0 means "do not touch the material channels" (SDF-only road). A valid
+	// Mixel4 index is 0..255 (8-bit-per-slot index word); anything else is rejected so the encode
+	// below stays in range.
+	const bool paint_material = material_index >= 0;
+	ERR_FAIL_COND(material_index >= 256);
 
 	// World -> local, same convention as do_path: positions and the radius-like extents are scaled
 	// by the inverse terrain transform so node scaling (finer voxel resolution) does not break edits.
@@ -228,7 +233,6 @@ void VoxelToolLodTerrain::do_flat_path(
 	const float half_width_local = half_width / scale_max;
 	const float smoothness_local = math::max(smoothness, 0.f) / scale_max;
 
-	const float sdf_scale = get_sdf_scale();
 	const float strength = get_sdf_strength();
 
 	// World height the road rises by, in voxel units (same units as the unscaled SDF returned by
@@ -243,8 +247,13 @@ void VoxelToolLodTerrain::do_flat_path(
 	VoxelData &data = _terrain->get_storage();
 	VoxelSingleValue sdf_default;
 	sdf_default.f = constants::SDF_FAR_OUTSIDE;
-	VoxelSingleValue road_default;
-	road_default.f = constants::SDF_FAR_OUTSIDE;
+	// Defaults for the material channels, only read when paint_material is set. An unset INDICES
+	// voxel reads as 0; blend_texture_packed_u16 fills slots on demand, so 0 is a safe starting
+	// point matching the rest of the edition code.
+	VoxelSingleValue indices_default;
+	indices_default.i = 0;
+	VoxelSingleValue weights_default;
+	weights_default.i = 0;
 
 	// Terrain-local trace points. The whole polyline is processed in ONE pass over ONE box so each
 	// voxel is visited EXACTLY ONCE. This is essential: the edit LOWERS the terrain SDF of a column
@@ -283,7 +292,7 @@ void VoxelToolLodTerrain::do_flat_path(
 	// SAME continuous height-field the generator produces, just offset, so the mesher reconstructs it
 	// as smoothly as the untouched terrain. The shift is feathered to 0 over edge_softness past
 	// half_width (smoothstep on the XZ distance to the NEAREST segment), giving a flat crown that
-	// blends into the terrain without a step. DATA6 gets the asphalt mask from the same XZ distance.
+	// blends into the terrain without a step.
 
 	// XZ distance from a column (x,z) to the whole polyline (minimum over segments), pruned by each
 	// segment's XZ bounding box so far-away segments are skipped. dist_xz only reads a/b in XZ, so
@@ -342,45 +351,41 @@ void VoxelToolLodTerrain::do_flat_path(
 	const Vector3i max_pos = box.position + box.size; // exclusive
 
 	// d_xz is Y-independent, so it is computed ONCE per (x,z) column and reused for the whole vertical
-	// span -- the dominant speedup, since a column spans many voxels. Columns with w <= 0 and no road
-	// effect are skipped entirely before touching any voxel.
+	// span -- the dominant speedup, since a column spans many voxels. Columns with w <= 0 are skipped
+	// entirely before touching any voxel.
 	for (int z = min_pos.z; z < max_pos.z; ++z) {
 		for (int x = min_pos.x; x < max_pos.x; ++x) {
 			const float d_xz = column_dist_xz(float(x), float(z)) - half_width_local;
 
 			// Column shift weight: 1 inside the strip, smoothly to 0 over edge_softness past the edge.
 			const float w = 1.0f - math::smoothstep(0.0f, edge_softness, d_xz);
-			const float strip_sdf = sdf_scale * d_xz;
-			// Skip the whole column if it neither shifts the surface nor needs an asphalt mask update
-			// (road default is FAR_OUTSIDE, so only strip_sdf below that can change anything).
-			const bool affects_sdf = w > 0.0f;
-			const bool affects_road = road_channel >= 0 && strip_sdf < constants::SDF_FAR_OUTSIDE;
-			if (!affects_sdf && !affects_road) {
+			if (w <= 0.0f) {
 				continue;
 			}
 
 			for (int y = min_pos.y; y < max_pos.y; ++y) {
 				const Vector3i pos(x, y, z);
 
-				if (affects_sdf) {
-					const float old_sdf = data.get_voxel(pos, VoxelBuffer::CHANNEL_SDF, sdf_default).f;
-					const float new_sdf = old_sdf - height_shift * w;
-					if (new_sdf != old_sdf) {
-						data.try_set_voxel_f(new_sdf, pos, VoxelBuffer::CHANNEL_SDF);
-					}
+				const float old_sdf = data.get_voxel(pos, VoxelBuffer::CHANNEL_SDF, sdf_default).f;
+				const float new_sdf = old_sdf - height_shift * w;
+				if (new_sdf != old_sdf) {
+					data.try_set_voxel_f(new_sdf, pos, VoxelBuffer::CHANNEL_SDF);
 				}
 
-				// Road channel (asphalt mask): the XZ strip distance itself, sign-compatible with the
-				// terrain SDF (negative inside). The mesher negates it via sdf_as_float -> positive
-				// inside the road -> shader paints asphalt where v_road > 0. XZ-only, so the whole
-				// raised strip is painted regardless of how thin the rise is.
-				if (affects_road) {
-					const float old_road =
-							data.get_voxel(pos, static_cast<VoxelBuffer::ChannelId>(road_channel), road_default).f;
-					const float new_road = math::min(old_road, strip_sdf);
-					if (new_road != old_road) {
-						data.try_set_voxel_f(new_road, pos, static_cast<VoxelBuffer::ChannelId>(road_channel));
-					}
+				// Paint the road material with the SAME column weight `w` that drives the rise. The
+				// Transvoxel surface vertex interpolates this weight with the same SDF parameter it
+				// uses for its position (see transvoxel.cpp on_vertex), so the texture border lands on
+				// the raise border with an identical soft edge. Applied to the whole column (like the
+				// SDF shift) so the surface voxel of each column carries the weight regardless of where
+				// the iso-surface sits vertically.
+				if (paint_material) {
+					uint32_t encoded_indices = static_cast<uint32_t>(
+							data.get_voxel(pos, VoxelBuffer::CHANNEL_INDICES, indices_default).i);
+					uint16_t encoded_weights = static_cast<uint16_t>(
+							data.get_voxel(pos, VoxelBuffer::CHANNEL_WEIGHTS, weights_default).i);
+					mixel4::blend_texture_packed_u16(material_index, w, encoded_indices, encoded_weights);
+					data.try_set_voxel(encoded_indices, pos, VoxelBuffer::CHANNEL_INDICES);
+					data.try_set_voxel(encoded_weights, pos, VoxelBuffer::CHANNEL_WEIGHTS);
 				}
 			}
 		}
@@ -420,6 +425,10 @@ void VoxelToolLodTerrain::do_path(Span<const Vector3> positions, Span<const floa
 
 PackedInt32Array VoxelToolLodTerrain::get_material_counts_in_sphere(Vector3 center, float radius) const {
 	ZN_PROFILE_SCOPE();
+	// The index word now holds 256 possible materials, but this drop-accounting histogram stays at
+	// 16 entries to keep the C# contract (VoxelEdits reads 16) stable: only material ids 0..15 are
+	// counted (the inventory/drop materials live there). Materials >= 16 are surface-only and are
+	// intentionally not aggregated here -- see the `dominant < 16` guard below.
 	PackedInt32Array out;
 	out.resize(16);
 	int32_t *out_ptr = out.ptrw();
@@ -479,8 +488,8 @@ PackedInt32Array VoxelToolLodTerrain::get_material_counts_in_sphere(Vector3 cent
 					// Stays solid -- this voxel does not disappear from the mesh.
 					continue;
 				}
-				const uint16_t packed_indices =
-						static_cast<uint16_t>(data.get_voxel(pos, VoxelBuffer::CHANNEL_INDICES, idx_default).i);
+				const uint32_t packed_indices =
+						static_cast<uint32_t>(data.get_voxel(pos, VoxelBuffer::CHANNEL_INDICES, idx_default).i);
 				const uint16_t packed_weights =
 						static_cast<uint16_t>(data.get_voxel(pos, VoxelBuffer::CHANNEL_WEIGHTS, weight_default).i);
 				const FixedArray<uint8_t, 4> indices = mixel4::decode_indices_from_packed_u16(packed_indices);
@@ -506,7 +515,7 @@ PackedInt32Array VoxelToolLodTerrain::get_material_counts_in_sphere(Vector3 cent
 int VoxelToolLodTerrain::do_sphere_add_with_material(Vector3 center, float radius, int material_index) {
 	ZN_PROFILE_SCOPE();
 	ERR_FAIL_COND_V(_terrain == nullptr, 0);
-	ERR_FAIL_COND_V(material_index < 0 || material_index >= 16, 0);
+	ERR_FAIL_COND_V(material_index < 0 || material_index >= 256, 0);
 	if (radius <= 0.0f) {
 		return 0;
 	}
@@ -548,18 +557,11 @@ int VoxelToolLodTerrain::do_sphere_add_with_material(Vector3 center, float radiu
 
 	// Encode the chosen material as Mixel4: dominant in slot 0 with full weight, the other 3 slots
 	// get distinct filler indices with zero weight (Mixel4 requires the 4 indices to be different).
-	uint8_t fill_slots[3];
-	int next = 0;
-	for (int candidate = 0; candidate < 16 && next < 3; ++candidate) {
-		if (candidate == material_index) {
-			continue;
-		}
-		fill_slots[next++] = static_cast<uint8_t>(candidate);
-	}
-	const uint16_t packed_indices = mixel4::encode_indices_to_packed_u16(
-			static_cast<uint8_t>(material_index), fill_slots[0], fill_slots[1], fill_slots[2]
-	);
-	const uint16_t packed_weights = mixel4::encode_weights_to_packed_u16_lossy(255, 0, 0, 0);
+	// Reuse the storage helper, which already produces 3 distinct fillers (wrapping at 256) and the
+	// single-texture weight word -- no need to roll the filler search here.
+	const uint32_t packed_indices =
+			mixel4::make_encoded_indices_for_single_texture(static_cast<uint8_t>(material_index));
+	const uint16_t packed_weights = mixel4::make_encoded_weights_for_single_texture();
 
 	int filled_count = 0;
 
@@ -597,7 +599,7 @@ int VoxelToolLodTerrain::do_sphere_add_with_material(Vector3 center, float radiu
 void VoxelToolLodTerrain::paint_voxels_material(PackedVector3Array positions, int material_index) {
 	ZN_PROFILE_SCOPE();
 	ERR_FAIL_COND(_terrain == nullptr);
-	ERR_FAIL_COND(material_index < 0 || material_index >= 16);
+	ERR_FAIL_COND(material_index < 0 || material_index >= 256);
 	if (positions.size() == 0) {
 		return;
 	}
@@ -631,8 +633,8 @@ void VoxelToolLodTerrain::paint_voxels_material(PackedVector3Array positions, in
 		const Vector3i pos(
 				Math::floor(positions[i].x), Math::floor(positions[i].y), Math::floor(positions[i].z)
 		);
-		uint16_t encoded_indices =
-				static_cast<uint16_t>(data.get_voxel(pos, VoxelBuffer::CHANNEL_INDICES, indices_default).i);
+		uint32_t encoded_indices =
+				static_cast<uint32_t>(data.get_voxel(pos, VoxelBuffer::CHANNEL_INDICES, indices_default).i);
 		uint16_t encoded_weights =
 				static_cast<uint16_t>(data.get_voxel(pos, VoxelBuffer::CHANNEL_WEIGHTS, weights_default).i);
 
@@ -1169,7 +1171,7 @@ void VoxelToolLodTerrain::_bind_methods() {
 			DEFVAL(0.0)
 	);
 	ClassDB::bind_method(
-			D_METHOD("do_flat_path", "positions", "half_width", "thickness", "smoothness", "road_channel"),
+			D_METHOD("do_flat_path", "positions", "half_width", "thickness", "smoothness", "material_index"),
 			&Self::do_flat_path,
 			DEFVAL(0.0),
 			DEFVAL(-1)

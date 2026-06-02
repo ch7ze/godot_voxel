@@ -273,7 +273,7 @@ void test_discord_soakil_copypaste() {
 			VoxelSingleValue default_weights;
 			default_weights.i = format.get_default_raw_value(VoxelBuffer::CHANNEL_WEIGHTS);
 
-			const uint16_t packed_indices_in_platform =
+			const uint32_t packed_indices_in_platform =
 					vd.get_voxel(Vector3i(0, 0, 0), VoxelBuffer::CHANNEL_INDICES, default_indices).i;
 			const uint16_t packed_weights_in_platform =
 					vd.get_voxel(Vector3i(0, 0, 0), VoxelBuffer::CHANNEL_WEIGHTS, default_weights).i;
@@ -281,7 +281,8 @@ void test_discord_soakil_copypaste() {
 			check_indices_and_weights_in_platform(packed_indices_in_platform, packed_weights_in_platform);
 		}
 
-		static void check_indices_and_weights_in_platform(uint16_t packed_indices, uint16_t packed_weights) {
+		// Index word is 32-bit (8-bit-per-slot, 256 materials); weights stay 16-bit.
+		static void check_indices_and_weights_in_platform(uint32_t packed_indices, uint16_t packed_weights) {
 			const FixedArray<uint8_t, 4> indices_in_platform = mixel4::decode_indices_from_packed_u16(packed_indices);
 			unsigned int expected_material_index_index;
 			ZN_TEST_ASSERT(find(indices_in_platform, uint8_t(1), expected_material_index_index));
@@ -317,7 +318,7 @@ void test_discord_soakil_copypaste() {
 		const float sd_below_platform = buffer_before_edit.get_voxel_f(Vector3i(10, 0, 10), VoxelBuffer::CHANNEL_SDF);
 		ZN_TEST_ASSERT(sd_below_platform > 0.01f);
 
-		const uint16_t packed_indices_in_platform =
+		const uint32_t packed_indices_in_platform =
 				buffer_before_edit.get_voxel(pos_in_platform, VoxelBuffer::CHANNEL_INDICES);
 		const uint16_t packed_weights_in_platform =
 				buffer_before_edit.get_voxel(pos_in_platform, VoxelBuffer::CHANNEL_WEIGHTS);

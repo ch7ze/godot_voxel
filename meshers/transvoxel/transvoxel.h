@@ -75,12 +75,6 @@ struct MeshArrays {
 	StdVector<float> texturing_data_1f32;
 	StdVector<Vector2f> texturing_data_2f32;
 
-	// Optional per-vertex "road" scalar, sampled from an extra SDF channel (e.g. CHANNEL_DATA6).
-	// One float per vertex, interpolated along cell edges like positions. Stays empty unless the
-	// mesher is configured with a road channel, so non-road meshing is unaffected. Emitted as
-	// ARRAY_CUSTOM3 and read by the terrain shader as a sharp material mask (sign = inside/outside).
-	StdVector<float> road_data;
-
 	StdVector<int32_t> indices;
 
 	void clear() {
@@ -89,7 +83,6 @@ struct MeshArrays {
 		lod_data.clear();
 		texturing_data_1f32.clear();
 		texturing_data_2f32.clear();
-		road_data.clear();
 		indices.clear();
 	}
 
@@ -176,9 +169,6 @@ struct CellInfo {
 	uint32_t triangle_count;
 };
 
-// road_channel: optional extra SDF channel (e.g. CHANNEL_DATA6) sampled per vertex into
-// output.road_data and emitted as ARRAY_CUSTOM3 for a sharp shader material edge. -1 disables it
-// (no road stream, meshing unchanged).
 DefaultTextureIndicesData build_regular_mesh(
 		const VoxelBuffer &voxels,
 		const unsigned int sdf_channel,
@@ -188,8 +178,7 @@ DefaultTextureIndicesData build_regular_mesh(
 		MeshArrays &output,
 		StdVector<CellInfo> *cell_infos,
 		const float edge_clamp_margin,
-		const bool textures_ignore_air_voxels,
-		const int road_channel = -1
+		const bool textures_ignore_air_voxels
 );
 
 void build_transition_mesh(
@@ -202,8 +191,7 @@ void build_transition_mesh(
 		MeshArrays &output,
 		DefaultTextureIndicesData default_texture_indices_data,
 		const float edge_clamp_margin,
-		const bool textures_ignore_air_voxels,
-		const int road_channel = -1
+		const bool textures_ignore_air_voxels
 );
 
 } // namespace zylann::voxel::transvoxel

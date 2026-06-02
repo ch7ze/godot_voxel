@@ -313,7 +313,8 @@ void VoxelToolBuffer::do_path(Span<const Vector3> positions, Span<const float> r
 					ops::TextureBlendOp<ops::SdfRoundCone> op;
 					op.shape = shape;
 					op.texture_params = _texture_params;
-					dst.write_box_2_template<ops::TextureBlendOp<ops::SdfRoundCone>, uint16_t, uint16_t>(
+					// CHANNEL_INDICES is 32-bit (8-bit-per-slot, 256 materials); CHANNEL_WEIGHTS stays 16-bit.
+					dst.write_box_2_template<ops::TextureBlendOp<ops::SdfRoundCone>, uint32_t, uint16_t>(
 							local_box, VoxelBuffer::CHANNEL_INDICES, VoxelBuffer::CHANNEL_WEIGHTS, op, Vector3i()
 					);
 				} break;

@@ -164,7 +164,8 @@ public:
 			lock_write();
 		}
 		_box_loop(voxel_box, [action, channel0, channel1](VoxelBuffer &voxels, Box3i local_box, Vector3i voxel_offset) {
-			voxels.write_box_2_template<F, uint16_t, uint16_t>(local_box, channel0, channel1, action, voxel_offset);
+			// write_box_2 is used for the Mixel4 texture paint (INDICES 32-bit, WEIGHTS 16-bit).
+			voxels.write_box_2_template<F, uint32_t, uint16_t>(local_box, channel0, channel1, action, voxel_offset);
 		});
 		if (_spatial_lock != nullptr) {
 			unlock_write();
@@ -175,7 +176,8 @@ public:
 	template <typename F>
 	void write_box_2_no_lock(const Box3i &voxel_box, unsigned int channel0, unsigned int channel1, F action) {
 		_box_loop(voxel_box, [action, channel0, channel1](VoxelBuffer &voxels, Box3i local_box, Vector3i voxel_offset) {
-			voxels.write_box_2_template<F, uint16_t, uint16_t>(local_box, channel0, channel1, action, voxel_offset);
+			// write_box_2 is used for the Mixel4 texture paint (INDICES 32-bit, WEIGHTS 16-bit).
+			voxels.write_box_2_template<F, uint32_t, uint16_t>(local_box, channel0, channel1, action, voxel_offset);
 		});
 	}
 

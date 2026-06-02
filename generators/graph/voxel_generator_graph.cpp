@@ -230,7 +230,7 @@ void VoxelGeneratorGraph::gather_texturing_data_from_weight_outputs(
 							indices[oi] = weight_outputs[oi].layer_index;
 						}
 						mixel4::debug_check_texture_indices(indices);
-						const uint16_t encoded_indices =
+						const uint32_t encoded_indices =
 								mixel4::encode_indices_to_packed_u16(indices[0], indices[1], indices[2], indices[3]);
 						const uint16_t encoded_weights = mixel4::encode_weights_to_packed_u16_lossy(
 								weights[0], weights[1], weights[2], weights[3]
@@ -254,7 +254,7 @@ void VoxelGeneratorGraph::gather_texturing_data_from_weight_outputs(
 							weights[oi] = math::clamp(weight * 255.f, 0.f, 255.f);
 							indices[oi] = weight_outputs[oi].layer_index;
 						}
-						const uint16_t encoded_indices =
+						const uint32_t encoded_indices =
 								mixel4::encode_indices_to_packed_u16(indices[0], indices[1], indices[2], indices[3]);
 						const uint16_t encoded_weights = mixel4::encode_weights_to_packed_u16_lossy(
 								weights[0], weights[1], weights[2], weights[3]
@@ -301,7 +301,7 @@ void VoxelGeneratorGraph::gather_texturing_data_from_weight_outputs(
 						for (unsigned int oi = recorded_weights; oi < indices.size(); ++oi) {
 							indices[oi] = skipped_outputs[oi - recorded_weights];
 						}
-						const uint16_t encoded_indices =
+						const uint32_t encoded_indices =
 								mixel4::encode_indices_to_packed_u16(indices[0], indices[1], indices[2], indices[3]);
 						const uint16_t encoded_weights = mixel4::encode_weights_to_packed_u16_lossy(
 								weights[0], weights[1], weights[2], weights[3]
@@ -355,7 +355,7 @@ void fill_texturing_data_from_single_texture_index(
 			const uint8_t cindex = math::clamp(index, 0, 15);
 			// Make sure other indices are different so the weights associated with them don't
 			// override the first index's weight
-			const uint16_t encoded_indices = mixel4::make_encoded_indices_for_single_texture(cindex);
+			const uint32_t encoded_indices = mixel4::make_encoded_indices_for_single_texture(cindex);
 			const uint16_t encoded_weights = mixel4::make_encoded_weights_for_single_texture();
 			out_buffer.fill_area(encoded_indices, rmin, rmax, VoxelBuffer::CHANNEL_INDICES);
 			out_buffer.fill_area(encoded_weights, rmin, rmax, VoxelBuffer::CHANNEL_WEIGHTS);
@@ -382,7 +382,7 @@ void fill_texturing_data_from_single_texture_index(
 			const uint8_t cindex = math::clamp(index, 0, 15);
 			// Make sure other indices are different so the weights associated with them don't
 			// override the first index's weight
-			const uint16_t encoded_indices = mixel4::make_encoded_indices_for_single_texture(cindex);
+			const uint32_t encoded_indices = mixel4::make_encoded_indices_for_single_texture(cindex);
 			const uint16_t encoded_weights = mixel4::make_encoded_weights_for_single_texture();
 			out_buffer.fill(encoded_indices, VoxelBuffer::CHANNEL_INDICES);
 			out_buffer.fill(encoded_weights, VoxelBuffer::CHANNEL_WEIGHTS);
@@ -423,7 +423,7 @@ void gather_texturing_data_from_single_texture_output(
 			for (int rz = rmin.z; rz < rmax.z; ++rz) {
 				for (int rx = rmin.x; rx < rmax.x; ++rx) {
 					const uint8_t index = math::clamp(int(Math::round(buffer_data[value_index])), 0, 15);
-					const uint16_t encoded_indices = mixel4::make_encoded_indices_for_single_texture(index);
+					const uint32_t encoded_indices = mixel4::make_encoded_indices_for_single_texture(index);
 					out_voxel_buffer.set_voxel(encoded_indices, rx, ry, rz, VoxelBuffer::CHANNEL_INDICES);
 					++value_index;
 				}
@@ -652,6 +652,12 @@ VoxelGenerator::Result VoxelGeneratorGraph::generate_block(VoxelGenerator::Voxel
 	VoxelBuffer &out_buffer = input.voxel_buffer;
 
 #ifdef TOOLS_ENABLED
+	// NOTE: This VoxelGeneratorGraph (CPU) Mixel4 path was NOT migrated to the 256-material
+	// (32-bit, 8-bit-per-slot) index layout. It still expects/produces a 16-bit index word
+	// (4-bit-per-slot, max 16 materials) and the index clamps below stay 0..15. This project does
+	// not use VoxelGeneratorGraph (it uses a C# VoxelGeneratorScript), so this path is dead code
+	// here and is left 16-bit. If VoxelGeneratorGraph is ever used with the Mixel4 mesher, this
+	// path must be rewritten to 32-bit indices (or CHANNEL_INDICES forced to DEPTH_16 for it).
 	switch (_texture_mode) {
 		case TEXTURE_MODE_MIXEL4: {
 			const VoxelBuffer::Depth indices_depth = out_buffer.get_channel_depth(VoxelBuffer::CHANNEL_INDICES);

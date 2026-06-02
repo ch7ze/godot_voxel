@@ -129,16 +129,6 @@ void fill_surface_arrays(Array &arrays, const transvoxel::MeshArrays &src) {
 		arrays[Mesh::ARRAY_CUSTOM1] = texturing_data;
 	}
 
-	// Optional per-vertex road scalar -> ARRAY_CUSTOM3 (1 float). Only present when a road channel
-	// was configured; otherwise the stream is empty and CUSTOM3 is left unset, so the mesh format
-	// is unchanged for non-road worlds.
-	if (src.road_data.size() != 0) {
-		PackedFloat32Array road_data;
-		road_data.resize(src.road_data.size());
-		memcpy(road_data.ptrw(), src.road_data.data(), road_data.size() * sizeof(float));
-		arrays[Mesh::ARRAY_CUSTOM3] = road_data;
-	}
-
 	arrays[Mesh::ARRAY_CUSTOM0] = lod_data;
 	arrays[Mesh::ARRAY_INDEX] = indices;
 }
@@ -223,8 +213,6 @@ void simplify(
 	remap_vertex_array(src_mesh.lod_data, dst_mesh.lod_data, remap_indices, unique_vertex_count);
 	remap_vertex_array(src_mesh.texturing_data_1f32, dst_mesh.texturing_data_1f32, remap_indices, unique_vertex_count);
 	remap_vertex_array(src_mesh.texturing_data_2f32, dst_mesh.texturing_data_2f32, remap_indices, unique_vertex_count);
-	// Per-vertex road scalar follows the same remap as the other vertex streams (empty = no-op).
-	remap_vertex_array(src_mesh.road_data, dst_mesh.road_data, remap_indices, unique_vertex_count);
 
 	dst_mesh.indices.resize(lod_indices.size());
 	// TODO Not sure if arguments are correct
@@ -248,10 +236,10 @@ static VoxelMesherTransvoxel::TexturingMode check_texturing_mode(
 	switch (expected_tex_mode) {
 		case VoxelMesherTransvoxel::TEXTURES_MIXEL4_S4: {
 			const VoxelBuffer::Depth indices_depth = vb.get_channel_depth(VoxelBuffer::CHANNEL_INDICES);
-			if (indices_depth != VoxelBuffer::DEPTH_16_BIT) {
+			if (indices_depth != VoxelBuffer::DEPTH_32_BIT) {
 				ZN_PRINT_ERROR_ONCE(format(
-						"The Indices channel is set to {} bits, but 16 bits are necessary to use the Mixel4 texturing "
-						"mode.",
+						"The Indices channel is set to {} bits, but 32 bits are necessary to use the Mixel4 texturing "
+						"mode (8-bit-per-slot index word, 256 materials).",
 						VoxelBuffer::get_depth_byte_count(indices_depth)
 				));
 				return VoxelMesherTransvoxel::TEXTURES_NONE;
@@ -332,8 +320,7 @@ void VoxelMesherTransvoxel::build(VoxelMesher::Output &output, const VoxelMesher
 			mesh_arrays,
 			cell_infos,
 			_edge_clamp_margin,
-			_textures_ignore_air_voxels,
-			_road_channel
+			_textures_ignore_air_voxels
 	);
 
 	if (mesh_arrays.vertices.size() == 0) {
@@ -381,8 +368,7 @@ void VoxelMesherTransvoxel::build(VoxelMesher::Output &output, const VoxelMesher
 					*combined_mesh_arrays,
 					default_texture_indices_data,
 					_edge_clamp_margin,
-					_textures_ignore_air_voxels,
-					_road_channel
+					_textures_ignore_air_voxels
 			);
 		}
 	}
@@ -410,12 +396,6 @@ void VoxelMesherTransvoxel::build(VoxelMesher::Output &output, const VoxelMesher
 		default:
 			ZN_PRINT_ERROR("Unhandled texture mode");
 			break;
-	}
-
-	// Road data (per-vertex scalar in CUSTOM3). Declared only when actually produced, so the format
-	// matches the arrays filled in fill_surface_arrays and non-road meshes keep their old format.
-	if (combined_mesh_arrays->road_data.size() != 0) {
-		output.mesh_flags |= (RenderingServerEnums::ARRAY_CUSTOM_R_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM3_SHIFT);
 	}
 }
 
@@ -539,20 +519,6 @@ VoxelBuffer::ChannelId VoxelMesherTransvoxel::get_sdf_channel() const {
 	return _sdf_channel;
 }
 
-void VoxelMesherTransvoxel::set_road_channel(int channel) {
-	// -1 disables; otherwise must be a valid channel index. Plain int (not the channel enum) so the
-	// "disabled" sentinel is expressible.
-	ZN_ASSERT_RETURN(channel == -1 || (channel >= 0 && channel < VoxelBuffer::MAX_CHANNELS));
-	if (channel != _road_channel) {
-		_road_channel = channel;
-		emit_changed();
-	}
-}
-
-int VoxelMesherTransvoxel::get_road_channel() const {
-	return _road_channel;
-}
-
 void VoxelMesherTransvoxel::_b_set_sdf_channel(godot::VoxelBuffer::ChannelId p_channel) {
 	set_sdf_channel(VoxelBuffer::ChannelId(p_channel));
 }
@@ -595,11 +561,6 @@ void VoxelMesherTransvoxel::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("set_sdf_channel", "channel"), &Self::_b_set_sdf_channel);
 	ClassDB::bind_method(D_METHOD("get_sdf_channel"), &Self::_b_get_sdf_channel);
-
-	// Plain int (channel index, or -1 to disable). No enum wrapper needed; called from C# to point
-	// the mesher at the road distance-field channel (e.g. CHANNEL_DATA6).
-	ClassDB::bind_method(D_METHOD("set_road_channel", "channel"), &Self::set_road_channel);
-	ClassDB::bind_method(D_METHOD("get_road_channel"), &Self::get_road_channel);
 
 	ADD_GROUP("Materials", "");
 

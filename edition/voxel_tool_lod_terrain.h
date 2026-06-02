@@ -49,12 +49,16 @@ public:
 	// (unlike do_path, which makes a round tube). half_width is the horizontal half-extent, thickness
 	// the full vertical extent; the slab center line slopes between each point's Y. `smoothness`
 	// blends the slab into the existing terrain over a soft radius (world meters) so it merges with a
-	// rounded fillet instead of a hard crease; 0 = plain union. The slab SDF raises CHANNEL_SDF and,
-	// if `road_channel` >= 0, is ALSO written there (same sign as the terrain SDF) so a road mask is
-	// pixel-aligned with the raised geometry in one pass; -1 disables the mask write. Used for roads
-	// (see VoxelEdits.BuildRoadPath). PackedVector3Array (not Span) so it binds directly to C#.
+	// rounded fillet instead of a hard crease; 0 = plain union. The slab SDF raises CHANNEL_SDF along
+	// the trace. Used for roads (see VoxelEdits.BuildRoadPath). PackedVector3Array (not Span) so it
+	// binds directly to C#.
+	// material_index (Mixel4 index 0..255, or -1 = leave material untouched): when >= 0, the same
+	// per-column shift weight `w` that raises the surface is ALSO blended into CHANNEL_INDICES /
+	// CHANNEL_WEIGHTS, so the painted material follows the road rise with an identical soft edge
+	// (texture border == raise border). -1 keeps the old behaviour (SDF only).
 	void do_flat_path(
-			PackedVector3Array positions, float half_width, float thickness, float smoothness, int road_channel);
+			PackedVector3Array positions, float half_width, float thickness, float smoothness,
+			int material_index = -1);
 	float get_voxel_f_interpolated(Vector3 position) const override;
 
 	// Counts solid voxels inside the SDF sphere and aggregates their dominant Mixel4 material.

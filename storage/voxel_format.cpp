@@ -32,7 +32,9 @@ VoxelFormat::DepthRange VoxelFormat::get_supported_depths(const VoxelBuffer::Cha
 		case VoxelBuffer::CHANNEL_COLOR:
 			return { 1, 4 };
 		case VoxelBuffer::CHANNEL_INDICES:
-			return { 1, 2 };
+			// Up to 4 bytes (32-bit): the Mixel4 index word now packs 4 slots x 8 bits = 256
+			// materials. 16-bit (4-bit-per-slot, 16 materials) stays supported for legacy buffers.
+			return { 1, 4 };
 		case VoxelBuffer::CHANNEL_WEIGHTS:
 			return { 2, 2 };
 		case VoxelBuffer::CHANNEL_DATA5:

@@ -508,7 +508,7 @@ void test_voxel_graph_generator_texturing() {
 					bool weight0_must_be_1,
 					bool weight1_must_be_1
 			) {
-				const uint16_t encoded_indices = buffer.get_voxel(pos, VoxelBuffer::CHANNEL_INDICES);
+				const uint32_t encoded_indices = buffer.get_voxel(pos, VoxelBuffer::CHANNEL_INDICES);
 				const uint16_t encoded_weights = buffer.get_voxel(pos, VoxelBuffer::CHANNEL_WEIGHTS);
 				const FixedArray<uint8_t, 4> indices = mixel4::decode_indices_from_packed_u16(encoded_indices);
 				const FixedArray<uint8_t, 4> weights = mixel4::decode_weights_from_packed_u16(encoded_weights);
@@ -1740,13 +1740,24 @@ void test_voxel_graph_spots2d_optimized_execution_map() {
 			return s;
 		}
 
+		// Index words are 32-bit now (8-bit-per-slot, 256 materials), so print all 8 nibbles.
+		static StdString print_u32_hex(uint32_t x) {
+			const char *s_chars = "0123456789abcdef";
+			StdString s;
+			for (int i = 7; i >= 0; --i) {
+				const unsigned int nibble = (x >> (i * 4)) & 0xf;
+				s += s_chars[nibble];
+			}
+			return s;
+		}
+
 		static void print_indices_and_weights(const VoxelBuffer &vb, int y) {
 			Vector3i pos(0, y, 0);
 			StdString s;
 			for (pos.z = 0; pos.z < vb.get_size().z; ++pos.z) {
 				for (pos.x = 0; pos.x < vb.get_size().x; ++pos.x) {
-					const uint16_t encoded_indices = vb.get_voxel(pos, VoxelBuffer::CHANNEL_INDICES);
-					s += print_u16_hex(encoded_indices);
+					const uint32_t encoded_indices = vb.get_voxel(pos, VoxelBuffer::CHANNEL_INDICES);
+					s += print_u32_hex(encoded_indices);
 					s += " ";
 				}
 				s += " | ";

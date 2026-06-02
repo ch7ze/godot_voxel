@@ -88,7 +88,9 @@ const char *VoxelBuffer::get_channel_name(const ChannelId id) {
 // should be possible to cast it back to the actual type with no loss of data, as long as all bits are preserved.
 static constexpr uint16_t DEFAULT_RAW_SDF_16BIT = uint16_t(snorm_to_s16(1.f));
 
-static constexpr uint16_t MIXEL4_DEFAULT_INDICES = mixel4::encode_indices_to_packed_u16(0, 1, 2, 3);
+// 32-bit now: the index word holds 4 slots x 8 bits (256 materials). Truncating to uint16_t
+// would drop slots 2 and 3 of the default 0,1,2,3 layout.
+static constexpr uint32_t MIXEL4_DEFAULT_INDICES = mixel4::encode_indices_to_packed_u16(0, 1, 2, 3);
 static constexpr uint16_t MIXEL4_DEFAULT_WEIGHTS = mixel4::encode_weights_to_packed_u16_lossy(255, 0, 0, 0);
 
 uint64_t VoxelBuffer::get_default_raw_value(const VoxelBuffer::ChannelId channel, const VoxelBuffer::Depth depth) {
@@ -127,6 +129,10 @@ uint64_t VoxelBuffer::get_default_indices_raw_value(const Depth depth) {
 		case DEPTH_8_BIT:
 			return 0;
 		case DEPTH_16_BIT:
+			// Legacy 4-bit-per-slot layout (kept for buffers explicitly forced to 16-bit).
+			return mixel4::encode_indices_to_packed_u16(0, 1, 2, 3) & 0xffff;
+		case DEPTH_32_BIT:
+			// Current default: 8-bit-per-slot layout (256 materials), slots 0,1,2,3.
 			return MIXEL4_DEFAULT_INDICES;
 		default:
 			ZN_PRINT_ERROR("Unsupported depth");

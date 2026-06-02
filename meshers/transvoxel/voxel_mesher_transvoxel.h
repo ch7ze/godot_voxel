@@ -61,13 +61,6 @@ public:
 	void set_sdf_channel(VoxelBuffer::ChannelId channel);
 	VoxelBuffer::ChannelId get_sdf_channel() const;
 
-	// Optional extra SDF channel sampled per vertex into ARRAY_CUSTOM3 (a "road" distance field,
-	// e.g. CHANNEL_DATA6 for land roads, later CHANNEL_DATA7 for water roads). -1 disables it: no
-	// CUSTOM3 stream, meshing unchanged. The consuming shader turns its sign into a sharp material
-	// edge. Channel-parametric so the same code serves different road kinds.
-	void set_road_channel(int channel);
-	int get_road_channel() const;
-
 private:
 	// Variant-bindable wrappers around set/get_sdf_channel: VARIANT_ENUM_CAST is registered
 	// only for the godot::VoxelBuffer::ChannelId alias, so ClassDB::bind_method must accept
@@ -127,10 +120,6 @@ private:
 	// a second VoxelMesherTransvoxel instance configured with CHANNEL_DATA5 is used by
 	// VoxelMesherHybrid to mesh a separate fluid iso-surface from the same buffer.
 	VoxelBuffer::ChannelId _sdf_channel = VoxelBuffer::CHANNEL_SDF;
-
-	// Optional road distance-field channel sampled into ARRAY_CUSTOM3. -1 = disabled (default), so
-	// existing setups are unaffected until explicitly configured (e.g. CHANNEL_DATA6).
-	int _road_channel = -1;
 };
 
 } // namespace zylann::voxel
