@@ -1186,11 +1186,12 @@ Span<const float> get_road_channel_as_float(const VoxelBuffer &voxels, const int
 
 	if (voxels.get_channel_compression(channel) == VoxelBuffer::COMPRESSION_UNIFORM) {
 		// Uniform block: one value for all voxels. The overwhelmingly common case is a road-free
-		// block, whose road SDF is uniformly positive (outside). Return an EMPTY span there so the
-		// RoadSampler stays inactive: no per-vertex road_data is produced, and the hybrid mesher
-		// fills a single constant inert CUSTOM3 per surface instead. This keeps road meshing nearly
-		// free for the vast majority of blocks even though the road channel is globally enabled.
-		// A uniform block that is entirely inside a road (negative) is meshed normally.
+		// block. Values here go through sdf_as_float (same as the per-vertex path), which NEGATES the
+		// stored SDF: the road channel stores the slab SDF with the terrain sign (positive outside),
+		// so after sdf_as_float "outside" is NEGATIVE and "inside the road" is POSITIVE. A block that
+		// is uniformly outside (v <= 0) carries no road, so return an EMPTY span and let the hybrid
+		// mesher fill a single constant inert CUSTOM3 per surface -- road meshing stays nearly free
+		// for the vast majority of blocks even though the road channel is globally enabled.
 		float v = 0.f;
 		switch (voxels.get_channel_depth(channel)) {
 			case VoxelBuffer::DEPTH_8_BIT:
@@ -1200,10 +1201,10 @@ Span<const float> get_road_channel_as_float(const VoxelBuffer &voxels, const int
 				v = sdf_as_float(static_cast<int16_t>(voxels.get_voxel(Vector3i(), channel)));
 				break;
 			default:
-				v = 1.f; // unsupported depth: treat as "outside road"
+				v = -1.f; // unsupported depth: treat as "outside road"
 				break;
 		}
-		if (v >= 0.f) {
+		if (v <= 0.f) {
 			// Entirely outside any road: inactive (empty span).
 			return Span<const float>();
 		}

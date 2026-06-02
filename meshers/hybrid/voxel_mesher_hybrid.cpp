@@ -142,8 +142,11 @@ PackedFloat32Array build_material_id_stream(int vertex_count, float material_id)
 // Per-vertex road scalar lives in CUSTOM3 (1 float). When the road channel is enabled, every
 // surface in the chunk must carry it (build_mesh applies one mesh_flags value to all surfaces).
 // Surfaces without real road data (models, water, terrain blocks with no road) get this inert
-// value, which is positive so the shader's sign test classifies them as "outside the road".
-constexpr float ROAD_OUTSIDE_VALUE = 1.0f;
+// value. It must match what real road_data carries OUTSIDE a road: the road channel stores the slab
+// SDF with the terrain sign (positive outside), read through sdf_as_float (which negates), so
+// "outside" arrives NEGATIVE at the shader. The shader's road test is `v_road > 0`, hence the inert
+// outside value is negative.
+constexpr float ROAD_OUTSIDE_VALUE = -1.0f;
 constexpr int HYBRID_CUSTOM_MESH_FLAG_ROAD =
 		(RenderingServerEnums::ARRAY_CUSTOM_R_FLOAT << Mesh::ARRAY_FORMAT_CUSTOM3_SHIFT);
 

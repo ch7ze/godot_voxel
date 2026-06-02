@@ -47,10 +47,14 @@ public:
 	// Lays a FLAT slab strip along the polyline `positions` -- a road-like band of constant width
 	// and thickness, rounded at the segment ends in the horizontal plane but flat on top and bottom
 	// (unlike do_path, which makes a round tube). half_width is the horizontal half-extent, thickness
-	// the full vertical extent; the slab is centered vertically on each point's Y. The current mode
-	// (Add/Remove) and channel apply, like the other do_* edits. Used for roads (see
-	// VoxelEdits.BuildRoadPath). PackedVector3Array (not Span) so it binds directly to C#.
-	void do_flat_path(PackedVector3Array positions, float half_width, float thickness);
+	// the full vertical extent; the slab center line slopes between each point's Y. `smoothness`
+	// blends the slab into the existing terrain over a soft radius (world meters) so it merges with a
+	// rounded fillet instead of a hard crease; 0 = plain union. The slab SDF raises CHANNEL_SDF and,
+	// if `road_channel` >= 0, is ALSO written there (same sign as the terrain SDF) so a road mask is
+	// pixel-aligned with the raised geometry in one pass; -1 disables the mask write. Used for roads
+	// (see VoxelEdits.BuildRoadPath). PackedVector3Array (not Span) so it binds directly to C#.
+	void do_flat_path(
+			PackedVector3Array positions, float half_width, float thickness, float smoothness, int road_channel);
 	float get_voxel_f_interpolated(Vector3 position) const override;
 
 	// Counts solid voxels inside the SDF sphere and aggregates their dominant Mixel4 material.

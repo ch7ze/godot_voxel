@@ -278,6 +278,18 @@ struct SdfUnion {
 	}
 };
 
+// Like SdfUnion but blends the added shape into the existing surface over a soft radius
+// (smoothness), so a flat slab merges into uneven terrain with a rounded fillet instead of a hard
+// min() crease. smoothness == 0 falls back to a plain union. Used by do_flat_path for roads.
+struct SdfSmoothUnion {
+	float strength;
+	float smoothness;
+	inline float operator()(float a, float b) const {
+		const float u = smoothness > 0.0001f ? math::sdf_smooth_union(a, b, smoothness) : math::sdf_union(a, b);
+		return math::lerp(a, u, strength);
+	}
+};
+
 struct SdfSubtract {
 	float strength;
 	inline float operator()(float a, float b) const {
@@ -428,22 +440,30 @@ Box3i get_round_cone_int_bounds(Vector3f p0, Vector3f p1, float r0, float r1);
 // SDF of a flat slab segment: a road-like strip running from a to b. Width (half_width) is the
 // horizontal half-extent measured as distance to the segment in the XZ plane (so it works for any
 // segment direction, unlike an axis-aligned box). Height (half_height) is the vertical half-extent
-// around plane_y. The slab is rounded at the segment ends in XZ (capsule-like footprint) but FLAT
-// on top and bottom -- the shape a road wants, instead of the round tube do_path/round-cone makes.
+// around the slab's center line. The slab is rounded at the segment ends in XZ (capsule-like
+// footprint) but FLAT on top and bottom -- the shape a road wants, instead of the round tube
+// do_path/round-cone makes.
 //
-// Distance: combine the 2D (XZ) distance to the segment with the 1D (Y) distance to the slab's
-// vertical band, the standard SDF "extrude/intersect" via max(): a point is inside only when it is
-// both within half_width of the segment in XZ AND within half_height of plane_y.
+// The slab center line is SLOPED: its Y interpolates from a.y to b.y along the segment (by the same
+// XZ projection parameter used for the distance), so a segment between two points at different
+// heights becomes a ramp following both endpoints instead of a flat platform at one height. To
+// follow uneven terrain, the caller passes a polyline with enough points (each at the ground
+// height there); each segment is then a short straight ramp between consecutive ground samples.
+//
+// Distance: combine the 2D (XZ) distance to the segment with the 1D (Y) distance to the sloped
+// center line, the standard SDF box-style combine, so a point is inside only when it is both within
+// half_width of the segment in XZ AND within half_height of the local (interpolated) center Y.
 struct SdfFlatPathSegment {
 	Vector3f a; // segment start (world/local voxel space)
 	Vector3f b; // segment end
 	float half_width; // XZ half-extent (road half-width)
 	float half_height; // Y half-extent (half the slab thickness)
-	float plane_y; // Y center of the slab
 	float sdf_scale;
 
-	inline float dist_xz(Vector3f pos) const {
-		// Closest point on segment a..b, projected to XZ (ignore Y so the slab is horizontal).
+	// Returns the XZ distance to the segment and, via out_t, the clamped projection parameter
+	// (0 at a, 1 at b) used to interpolate the center Y.
+	inline float dist_xz(Vector3f pos, float &out_t) const {
+		// Closest point on segment a..b, projected to XZ (ignore Y so the footprint is horizontal).
 		const float ax = a.x, az = a.z;
 		const float bx = b.x, bz = b.z;
 		const float pax = pos.x - ax, paz = pos.z - az;
@@ -454,14 +474,18 @@ struct SdfFlatPathSegment {
 			t = (pax * bax + paz * baz) / ba_len2;
 			t = math::clamp(t, 0.f, 1.f);
 		}
+		out_t = t;
 		const float dx = pax - bax * t;
 		const float dz = paz - baz * t;
 		return Math::sqrt(dx * dx + dz * dz);
 	}
 
 	inline float operator()(Vector3f pos) const {
-		const float d_xz = dist_xz(pos) - half_width;
-		const float d_y = Math::abs(pos.y - plane_y) - half_height;
+		float t;
+		const float d_xz = dist_xz(pos, t) - half_width;
+		// Sloped center: interpolate Y between the endpoints at the projected parameter.
+		const float center_y = a.y + (b.y - a.y) * t;
+		const float d_y = Math::abs(pos.y - center_y) - half_height;
 		// SDF of the intersection of the XZ disc-swept strip and the Y band.
 		// Exterior distance = length(max(d,0)); interior = min(max(d_xz,d_y), 0). Standard box-style
 		// combine, giving correct rounded-outside / sharp-edge behavior.
@@ -481,8 +505,9 @@ struct SdfFlatPathSegment {
 		const float maxx = math::max(a.x, b.x) + half_width;
 		const float minz = math::min(a.z, b.z) - half_width;
 		const float maxz = math::max(a.z, b.z) + half_width;
-		const float miny = plane_y - half_height;
-		const float maxy = plane_y + half_height;
+		// Vertical bounds span both endpoint heights (sloped center) plus the slab half-thickness.
+		const float miny = math::min(a.y, b.y) - half_height;
+		const float maxy = math::max(a.y, b.y) + half_height;
 		return Box3i::from_min_max(
 					   math::floor_to_int(Vector3f(minx, miny, minz)),
 					   math::ceil_to_int(Vector3f(maxx, maxy, maxz))

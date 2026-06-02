@@ -211,10 +211,12 @@ void VoxelToolLodTerrain::do_hemisphere(Vector3 center, float radius, Vector3 fl
 	_post_edit(op.box);
 }
 
-void VoxelToolLodTerrain::do_flat_path(PackedVector3Array positions, float half_width, float thickness) {
+void VoxelToolLodTerrain::do_flat_path(
+		PackedVector3Array positions, float half_width, float thickness, float smoothness, int road_channel) {
 	ZN_PROFILE_SCOPE();
 	ERR_FAIL_COND(_terrain == nullptr);
 	ERR_FAIL_COND(positions.size() < 2);
+	ERR_FAIL_COND(road_channel >= 0 && road_channel >= VoxelBuffer::MAX_CHANNELS);
 
 	// World -> local, same convention as do_path: positions and the radius-like extents are scaled
 	// by the inverse terrain transform so node scaling (finer voxel resolution) does not break edits.
@@ -224,54 +226,168 @@ void VoxelToolLodTerrain::do_flat_path(PackedVector3Array positions, float half_
 	const float scale_max = math::max(
 			math::max(Math::abs(scale.x), Math::abs(scale.y)), math::max(Math::abs(scale.z), 0.00001f));
 	const float half_width_local = half_width / scale_max;
-	const float half_height_local = (thickness * 0.5f) / scale_max;
+	const float smoothness_local = math::max(smoothness, 0.f) / scale_max;
 
 	const float sdf_scale = get_sdf_scale();
-	const ops::Mode mode = static_cast<ops::Mode>(get_mode());
+	const float strength = get_sdf_strength();
 
-	// One chunked slab per segment. Each rasterizes independently (segments overlap at shared
-	// points, which is fine for SdfUnion/Subtract). _post_edit is called once per segment over its
-	// own box, matching how do_sphere/do_hemisphere report their edits.
+	// World height the road rises by, in voxel units (same units as the unscaled SDF returned by
+	// get_voxel().f / get_unscaled_sdf: s16_to_snorm * 1/QUANTIZED_SDF_16_BITS_SCALE). thickness is
+	// the desired world rise; dividing by the terrain scale converts it to voxel units.
+	const float height_shift = (thickness / scale_max) * strength;
+	// Soft-edge width of the road shoulder in voxel units. The smoothness argument (already a soft
+	// width in world units) is reused so callers keep one knob; clamped to a minimum so the edge is
+	// always at least slightly feathered instead of a hard vertical wall.
+	const float edge_softness = math::max(smoothness_local, 0.01f);
+
+	VoxelData &data = _terrain->get_storage();
+	VoxelSingleValue sdf_default;
+	sdf_default.f = constants::SDF_FAR_OUTSIDE;
+	VoxelSingleValue road_default;
+	road_default.f = constants::SDF_FAR_OUTSIDE;
+
+	// Terrain-local trace points. The whole polyline is processed in ONE pass over ONE box so each
+	// voxel is visited EXACTLY ONCE. This is essential: the edit LOWERS the terrain SDF of a column
+	// by height_shift, which is NOT idempotent -- if overlapping per-segment boxes each read the
+	// already-shifted value and subtract again (the resample step ~0.5 vox is far smaller than
+	// half_width, so every voxel lies in several segment boxes), the rise would accumulate to a
+	// multiple of height_shift instead of exactly height_shift. One pass + per-COLUMN nearest-segment
+	// distance avoids that entirely.
 	const int64_t point_count = positions.size();
-	for (int64_t i = 1; i < point_count; ++i) {
-		const Vector3 p0w = to_local.xform(positions[i - 1]);
-		const Vector3 p1w = to_local.xform(positions[i]);
-
-		ops::DoShapeChunked<ops::SdfFlatPathSegment, ops::VoxelDataGridAccess> op;
-		op.shape.a = to_vec3f(p0w);
-		op.shape.b = to_vec3f(p1w);
-		op.shape.half_width = half_width_local;
-		op.shape.half_height = half_height_local;
-		// Slab vertical center: midpoint Y of the segment endpoints (the road follows the points'
-		// height). A short segment is essentially flat in Y, so a single plane_y is enough.
-		op.shape.plane_y = 0.5f * (static_cast<float>(p0w.y) + static_cast<float>(p1w.y));
-		op.shape.sdf_scale = sdf_scale;
-		op.box = op.shape.get_box().clipped(_terrain->get_voxel_bounds());
-		op.mode = mode;
-		op.texture_params = _texture_params;
-		op.blocky_value = _value;
-		op.channel = get_channel();
-		op.strength = get_sdf_strength();
-
-		if (!is_area_editable(op.box)) {
-			ZN_PRINT_WARNING("Area not editable");
-			continue;
-		}
-
-		VoxelData &data = _terrain->get_storage();
-		data.pre_generate_box(op.box);
-
-		VoxelDataGrid grid;
-		data.get_blocks_grid(grid, op.box, 0);
-		op.block_access.grid = &grid;
-
-		{
-			VoxelDataGrid::LockWrite wlock(grid);
-			op();
-		}
-
-		_post_edit(op.box);
+	StdVector<Vector3f> pts;
+	pts.resize(point_count);
+	for (int64_t i = 0; i < point_count; ++i) {
+		pts[i] = to_vec3f(to_local.xform(positions[i]));
 	}
+	const int64_t segment_count = point_count - 1;
+
+	// Per-segment XZ bounding boxes (widened by reach), used to skip segments that cannot affect a
+	// given column. reach is the largest XZ distance at which a column still gets a non-zero weight:
+	// half_width (full strip) plus edge_softness (the soft shoulder) plus a 1-voxel guard.
+	const float reach = half_width_local + edge_softness + 1.0f;
+	StdVector<float> seg_minx, seg_maxx, seg_minz, seg_maxz;
+	seg_minx.resize(segment_count);
+	seg_maxx.resize(segment_count);
+	seg_minz.resize(segment_count);
+	seg_maxz.resize(segment_count);
+	for (int64_t i = 0; i < segment_count; ++i) {
+		seg_minx[i] = math::min(pts[i].x, pts[i + 1].x) - reach;
+		seg_maxx[i] = math::max(pts[i].x, pts[i + 1].x) + reach;
+		seg_minz[i] = math::min(pts[i].z, pts[i + 1].z) - reach;
+		seg_maxz[i] = math::max(pts[i].z, pts[i + 1].z) + reach;
+	}
+
+	// Why this LOWERS the SDF to raise the road: the terrain SDF is vertically linear
+	// (d sdf / d y == 1, see the generator: sdf = worldY - height), so subtracting a constant from
+	// every voxel in a column moves the iso-surface (sdf == 0) up by exactly that constant -- the
+	// SAME continuous height-field the generator produces, just offset, so the mesher reconstructs it
+	// as smoothly as the untouched terrain. The shift is feathered to 0 over edge_softness past
+	// half_width (smoothstep on the XZ distance to the NEAREST segment), giving a flat crown that
+	// blends into the terrain without a step. DATA6 gets the asphalt mask from the same XZ distance.
+
+	// XZ distance from a column (x,z) to the whole polyline (minimum over segments), pruned by each
+	// segment's XZ bounding box so far-away segments are skipped. dist_xz only reads a/b in XZ, so
+	// the Y of the probe point is irrelevant -- passed as 0.
+	auto column_dist_xz = [&](float x, float z) -> float {
+		const Vector3f p(x, 0.f, z);
+		float best = constants::SDF_FAR_OUTSIDE;
+		for (int64_t i = 0; i < segment_count; ++i) {
+			if (x < seg_minx[i] || x > seg_maxx[i] || z < seg_minz[i] || z > seg_maxz[i]) {
+				continue; // column outside this segment's reach
+			}
+			ops::SdfFlatPathSegment seg;
+			seg.a = pts[i];
+			seg.b = pts[i + 1];
+			float t;
+			const float d = seg.dist_xz(p, t);
+			if (d < best) {
+				best = d;
+			}
+		}
+		return best;
+	};
+
+	// Single box over the whole trace. XZ widened by reach; vertical span widened by vertical_margin
+	// above AND below the trace Y range so every shoulder column's full surface neighbourhood is
+	// processed regardless of slope. vertical_margin covers the lateral surface variation (bounded by
+	// ~half_width per unit of slope) plus the rise itself.
+	const float vertical_margin = half_width_local + height_shift + 2.0f;
+	Vector3f bmin = pts[0];
+	Vector3f bmax = pts[0];
+	for (int64_t i = 1; i < point_count; ++i) {
+		bmin.x = math::min(bmin.x, pts[i].x);
+		bmin.y = math::min(bmin.y, pts[i].y);
+		bmin.z = math::min(bmin.z, pts[i].z);
+		bmax.x = math::max(bmax.x, pts[i].x);
+		bmax.y = math::max(bmax.y, pts[i].y);
+		bmax.z = math::max(bmax.z, pts[i].z);
+	}
+	const Box3i box = Box3i::from_min_max(
+							  math::floor_to_int(Vector3f(
+									  bmin.x - reach, bmin.y - vertical_margin, bmin.z - reach)),
+							  math::ceil_to_int(Vector3f(
+									  bmax.x + reach, bmax.y + vertical_margin, bmax.z + reach)))
+							  .clipped(_terrain->get_voxel_bounds());
+	if (box.is_empty()) {
+		return;
+	}
+	if (!is_area_editable(box)) {
+		ZN_PRINT_WARNING("Area not editable");
+		return;
+	}
+
+	data.pre_generate_box(box);
+
+	const Vector3i min_pos = box.position;
+	const Vector3i max_pos = box.position + box.size; // exclusive
+
+	// d_xz is Y-independent, so it is computed ONCE per (x,z) column and reused for the whole vertical
+	// span -- the dominant speedup, since a column spans many voxels. Columns with w <= 0 and no road
+	// effect are skipped entirely before touching any voxel.
+	for (int z = min_pos.z; z < max_pos.z; ++z) {
+		for (int x = min_pos.x; x < max_pos.x; ++x) {
+			const float d_xz = column_dist_xz(float(x), float(z)) - half_width_local;
+
+			// Column shift weight: 1 inside the strip, smoothly to 0 over edge_softness past the edge.
+			const float w = 1.0f - math::smoothstep(0.0f, edge_softness, d_xz);
+			const float strip_sdf = sdf_scale * d_xz;
+			// Skip the whole column if it neither shifts the surface nor needs an asphalt mask update
+			// (road default is FAR_OUTSIDE, so only strip_sdf below that can change anything).
+			const bool affects_sdf = w > 0.0f;
+			const bool affects_road = road_channel >= 0 && strip_sdf < constants::SDF_FAR_OUTSIDE;
+			if (!affects_sdf && !affects_road) {
+				continue;
+			}
+
+			for (int y = min_pos.y; y < max_pos.y; ++y) {
+				const Vector3i pos(x, y, z);
+
+				if (affects_sdf) {
+					const float old_sdf = data.get_voxel(pos, VoxelBuffer::CHANNEL_SDF, sdf_default).f;
+					const float new_sdf = old_sdf - height_shift * w;
+					if (new_sdf != old_sdf) {
+						data.try_set_voxel_f(new_sdf, pos, VoxelBuffer::CHANNEL_SDF);
+					}
+				}
+
+				// Road channel (asphalt mask): the XZ strip distance itself, sign-compatible with the
+				// terrain SDF (negative inside). The mesher negates it via sdf_as_float -> positive
+				// inside the road -> shader paints asphalt where v_road > 0. XZ-only, so the whole
+				// raised strip is painted regardless of how thin the rise is.
+				if (affects_road) {
+					const float old_road =
+							data.get_voxel(pos, static_cast<VoxelBuffer::ChannelId>(road_channel), road_default).f;
+					const float new_road = math::min(old_road, strip_sdf);
+					if (new_road != old_road) {
+						data.try_set_voxel_f(new_road, pos, static_cast<VoxelBuffer::ChannelId>(road_channel));
+					}
+				}
+			}
+		}
+	}
+
+	// Padding so neighbor blocks at the seam regenerate their meshes (matches do_sphere_add_with_material).
+	_post_edit(box.padded(2));
 }
 
 void VoxelToolLodTerrain::do_path(Span<const Vector3> positions, Span<const float> radii) {
@@ -1053,7 +1169,10 @@ void VoxelToolLodTerrain::_bind_methods() {
 			DEFVAL(0.0)
 	);
 	ClassDB::bind_method(
-			D_METHOD("do_flat_path", "positions", "half_width", "thickness"), &Self::do_flat_path
+			D_METHOD("do_flat_path", "positions", "half_width", "thickness", "smoothness", "road_channel"),
+			&Self::do_flat_path,
+			DEFVAL(0.0),
+			DEFVAL(-1)
 	);
 	ClassDB::bind_method(
 			D_METHOD("run_blocky_random_tick", "area", "voxel_count", "callback", "batch_count", "tags_mask"),

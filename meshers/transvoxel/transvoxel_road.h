@@ -66,12 +66,16 @@ struct RoadSampler {
 		materials::fill_redundant_transition_cell_values(partial, corner_values);
 	}
 
-	// alpha is the weight of corner v0 (same convention as the mixel4 processor's on_vertex).
+	// alpha is the weight of corner v1 (same convention as the position interpolation
+	// primaryf = p0*(1-alpha) + p1*alpha and the mixel4 processor's on_vertex, which uses
+	// Math::lerp(weights0, weights1, alpha)). The road value must follow the SAME convention so it
+	// lands on the iso surface where the vertex actually sits; otherwise the asphalt mask is mirrored
+	// across the cell edge and the material edge does not coincide with the rendered surface.
 	inline void on_vertex(const unsigned int v0, const unsigned int v1, const float alpha) {
 		if (!active) {
 			return;
 		}
-		const float value = corner_values[v0] * alpha + corner_values[v1] * (1.f - alpha);
+		const float value = corner_values[v0] * (1.f - alpha) + corner_values[v1] * alpha;
 		out.push_back(value);
 	}
 };
