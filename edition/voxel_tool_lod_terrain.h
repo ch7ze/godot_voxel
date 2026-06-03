@@ -52,13 +52,16 @@ public:
 	// rounded fillet instead of a hard crease; 0 = plain union. The slab SDF raises CHANNEL_SDF along
 	// the trace. Used for roads (see VoxelEdits.BuildRoadPath). PackedVector3Array (not Span) so it
 	// binds directly to C#.
-	// material_index (Mixel4 index 0..255, or -1 = leave material untouched): when >= 0, the same
-	// per-column shift weight `w` that raises the surface is ALSO blended into CHANNEL_INDICES /
-	// CHANNEL_WEIGHTS, so the painted material follows the road rise with an identical soft edge
-	// (texture border == raise border). -1 keeps the old behaviour (SDF only).
+	// material_index (Mixel4 index 0..255, or -1 = leave material untouched): when >= 0, a per-column
+	// weight is blended into CHANNEL_INDICES / CHANNEL_WEIGHTS so the painted material follows the
+	// road. paint_smoothness is the soft-edge width of the MATERIAL weight (world meters), separate
+	// from `smoothness` which feathers the height rise: a wider material edge spreads the asphalt
+	// weight over several voxels/cells, giving the shader's threshold enough interpolation support to
+	// render a straight (non-faceted) border, while the height feather can stay narrow. <= 0 falls
+	// back to `smoothness` (material edge == height edge). Ignored when material_index < 0.
 	void do_flat_path(
 			PackedVector3Array positions, float half_width, float thickness, float smoothness,
-			int material_index = -1);
+			int material_index = -1, float paint_smoothness = -1.0f);
 	float get_voxel_f_interpolated(Vector3 position) const override;
 
 	// Counts solid voxels inside the SDF sphere and aggregates their dominant Mixel4 material.

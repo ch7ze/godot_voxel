@@ -213,7 +213,7 @@ void VoxelToolLodTerrain::do_hemisphere(Vector3 center, float radius, Vector3 fl
 
 void VoxelToolLodTerrain::do_flat_path(
 		PackedVector3Array positions, float half_width, float thickness, float smoothness,
-		int material_index) {
+		int material_index, float paint_smoothness) {
 	ZN_PROFILE_SCOPE();
 	ERR_FAIL_COND(_terrain == nullptr);
 	ERR_FAIL_COND(positions.size() < 2);
@@ -243,6 +243,12 @@ void VoxelToolLodTerrain::do_flat_path(
 	// width in world units) is reused so callers keep one knob; clamped to a minimum so the edge is
 	// always at least slightly feathered instead of a hard vertical wall.
 	const float edge_softness = math::max(smoothness_local, 0.01f);
+	// Separate soft-edge width for the MATERIAL paint (in voxel units). When paint_smoothness <= 0 it
+	// falls back to the height edge_softness (material edge == height edge). A wider value spreads the
+	// asphalt weight over more columns/cells so the shader's threshold has enough interpolation
+	// support for a straight border, without widening the height feather.
+	const float paint_softness_local = paint_smoothness > 0.f ? (paint_smoothness / scale_max) : smoothness_local;
+	const float paint_edge_softness = math::max(paint_softness_local, edge_softness);
 
 	VoxelData &data = _terrain->get_storage();
 	VoxelSingleValue sdf_default;
@@ -272,8 +278,10 @@ void VoxelToolLodTerrain::do_flat_path(
 
 	// Per-segment XZ bounding boxes (widened by reach), used to skip segments that cannot affect a
 	// given column. reach is the largest XZ distance at which a column still gets a non-zero weight:
-	// half_width (full strip) plus edge_softness (the soft shoulder) plus a 1-voxel guard.
-	const float reach = half_width_local + edge_softness + 1.0f;
+	// half_width (full strip) plus the WIDER of the height/material soft shoulders plus a 1-voxel
+	// guard. The material edge can be wider than the height edge, and the box must cover it so the
+	// outer asphalt columns (paint weight > 0 but no height shift) are not clipped away.
+	const float reach = half_width_local + math::max(edge_softness, paint_edge_softness) + 1.0f;
 	StdVector<float> seg_minx, seg_maxx, seg_minz, seg_maxz;
 	seg_minx.resize(segment_count);
 	seg_maxx.resize(segment_count);
@@ -357,33 +365,38 @@ void VoxelToolLodTerrain::do_flat_path(
 		for (int x = min_pos.x; x < max_pos.x; ++x) {
 			const float d_xz = column_dist_xz(float(x), float(z)) - half_width_local;
 
-			// Column shift weight: 1 inside the strip, smoothly to 0 over edge_softness past the edge.
+			// Height shift weight: 1 inside the strip, smoothly to 0 over edge_softness past the edge.
 			const float w = 1.0f - math::smoothstep(0.0f, edge_softness, d_xz);
-			if (w <= 0.0f) {
+			// Material paint weight: same shape but over the (possibly wider) paint_edge_softness, so
+			// the asphalt weight spreads across more cells than the height feather for a straight edge.
+			const float w_paint = paint_material ? (1.0f - math::smoothstep(0.0f, paint_edge_softness, d_xz)) : 0.0f;
+			// Skip the column only if it affects neither the height nor the material.
+			if (w <= 0.0f && w_paint <= 0.0f) {
 				continue;
 			}
 
 			for (int y = min_pos.y; y < max_pos.y; ++y) {
 				const Vector3i pos(x, y, z);
 
-				const float old_sdf = data.get_voxel(pos, VoxelBuffer::CHANNEL_SDF, sdf_default).f;
-				const float new_sdf = old_sdf - height_shift * w;
-				if (new_sdf != old_sdf) {
-					data.try_set_voxel_f(new_sdf, pos, VoxelBuffer::CHANNEL_SDF);
+				if (w > 0.0f) {
+					const float old_sdf = data.get_voxel(pos, VoxelBuffer::CHANNEL_SDF, sdf_default).f;
+					const float new_sdf = old_sdf - height_shift * w;
+					if (new_sdf != old_sdf) {
+						data.try_set_voxel_f(new_sdf, pos, VoxelBuffer::CHANNEL_SDF);
+					}
 				}
 
-				// Paint the road material with the SAME column weight `w` that drives the rise. The
-				// Transvoxel surface vertex interpolates this weight with the same SDF parameter it
-				// uses for its position (see transvoxel.cpp on_vertex), so the texture border lands on
-				// the raise border with an identical soft edge. Applied to the whole column (like the
-				// SDF shift) so the surface voxel of each column carries the weight regardless of where
-				// the iso-surface sits vertically.
-				if (paint_material) {
+				// Paint the road material with its own (possibly wider) column weight w_paint. The
+				// Transvoxel surface vertex interpolates this weight per fragment; spreading it over
+				// several cells gives the shader's smoothstep threshold enough support for a straight
+				// border. Applied to the whole column so the surface voxel carries the weight
+				// regardless of where the iso-surface sits vertically.
+				if (paint_material && w_paint > 0.0f) {
 					uint32_t encoded_indices = static_cast<uint32_t>(
 							data.get_voxel(pos, VoxelBuffer::CHANNEL_INDICES, indices_default).i);
 					uint16_t encoded_weights = static_cast<uint16_t>(
 							data.get_voxel(pos, VoxelBuffer::CHANNEL_WEIGHTS, weights_default).i);
-					mixel4::blend_texture_packed_u16(material_index, w, encoded_indices, encoded_weights);
+					mixel4::blend_texture_packed_u16(material_index, w_paint, encoded_indices, encoded_weights);
 					data.try_set_voxel(encoded_indices, pos, VoxelBuffer::CHANNEL_INDICES);
 					data.try_set_voxel(encoded_weights, pos, VoxelBuffer::CHANNEL_WEIGHTS);
 				}
@@ -1171,10 +1184,12 @@ void VoxelToolLodTerrain::_bind_methods() {
 			DEFVAL(0.0)
 	);
 	ClassDB::bind_method(
-			D_METHOD("do_flat_path", "positions", "half_width", "thickness", "smoothness", "material_index"),
+			D_METHOD("do_flat_path", "positions", "half_width", "thickness", "smoothness", "material_index",
+					"paint_smoothness"),
 			&Self::do_flat_path,
 			DEFVAL(0.0),
-			DEFVAL(-1)
+			DEFVAL(-1),
+			DEFVAL(-1.0)
 	);
 	ClassDB::bind_method(
 			D_METHOD("run_blocky_random_tick", "area", "voxel_count", "callback", "batch_count", "tags_mask"),
