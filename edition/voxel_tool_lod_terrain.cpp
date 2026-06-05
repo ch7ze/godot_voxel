@@ -61,6 +61,26 @@ bool VoxelToolLodTerrain::is_area_editable(const Box3i &box) const {
 	return _terrain->get_storage().is_area_loaded(box);
 }
 
+bool VoxelToolLodTerrain::try_load_area_editable(AABB box) {
+	ERR_FAIL_COND_V(_terrain == nullptr, false);
+	// Same Aabb->Box3i convention as VoxelTool::_b_is_area_editable, so callers can use one box for
+	// the load and the subsequent editability check.
+	const Vector3i minp = math::floor_to_int(box.position);
+	const Vector3i maxp = math::ceil_to_int(box.position + box.size);
+	const Box3i ibox = Box3i::from_min_max(minp, maxp);
+	ERR_FAIL_COND_V(!Vector3iUtil::is_valid_size(ibox.size), false);
+	VoxelData &data = _terrain->get_storage();
+	// Note: no is_area_loaded() fast-path here. is_area_loaded only checks LOD0, but try_load_area
+	// must also ensure the higher LODs exist (otherwise update_lods fails when cascading the edit).
+	// try_load_area already skips blocks that are present per LOD cheaply (a read lock + has_voxels),
+	// so the redundant cost when everything is loaded is small and does not justify a LOD0-only
+	// shortcut that could leave higher LODs unloaded.
+	if (!data.try_load_area(ibox)) {
+		return false;
+	}
+	return data.is_area_loaded(ibox);
+}
+
 Ref<VoxelRaycastResult> VoxelToolLodTerrain::raycast(
 		Vector3 pos,
 		Vector3 dir,
@@ -662,6 +682,164 @@ void VoxelToolLodTerrain::paint_voxels_material(PackedVector3Array positions, in
 	_post_edit(box.padded(2));
 }
 
+// Batch-writes fluid SDF values into CHANNEL_DATA5 for a list of individual voxels, with a
+// SINGLE editability check, a SINGLE pre_generate and a SINGLE remesh over the bounding box --
+// and crucially WITHOUT emitting the `area_edited` signal. This is the bulk path for the
+// Minecraft-style fluid simulator, which rewrites a band of water-surface voxels every tick.
+//
+// Why no signal: the per-voxel set_voxel_f path (used previously) emitted `area_edited` for
+// each written voxel, which fanned out into a full multiplayer diff broadcast and a pathfinder
+// cache invalidation per voxel. Those consumers react to terrain channels (TYPE/SDF) only --
+// the fluid channel is neither replicated nor relevant to walkability, so the fan-out was pure
+// waste. The water surface still needs a remesh, which post_edit_area(..., emit=false) does.
+//
+// positions are voxel indices (floored). sdf_values must have the same length as positions;
+// sdf_values[i] is written at positions[i]. Mismatched lengths or an empty list are a no-op.
+void VoxelToolLodTerrain::set_voxels_fluid_sdf(PackedVector3Array positions, PackedFloat32Array sdf_values) {
+	ZN_PROFILE_SCOPE();
+	ERR_FAIL_COND(_terrain == nullptr);
+	ERR_FAIL_COND(positions.size() != sdf_values.size());
+	if (positions.size() == 0) {
+		return;
+	}
+
+	// Bounding box over all positions, so a single pre_generate / _post_edit covers them.
+	Vector3i min_pos(
+			Math::floor(positions[0].x), Math::floor(positions[0].y), Math::floor(positions[0].z)
+	);
+	Vector3i max_pos = min_pos;
+	for (int i = 0; i < positions.size(); ++i) {
+		const Vector3i p(Math::floor(positions[i].x), Math::floor(positions[i].y), Math::floor(positions[i].z));
+		min_pos = min_pos.min(p);
+		max_pos = max_pos.max(p);
+	}
+
+	const Box3i box = Box3i::from_min_max(min_pos, max_pos + Vector3i(1, 1, 1)).clipped(_terrain->get_voxel_bounds());
+	if (!is_area_editable(box)) {
+		ZN_PRINT_WARNING("Area not editable");
+		return;
+	}
+
+	VoxelData &data = _terrain->get_storage();
+	data.pre_generate_box(box);
+
+	for (int i = 0; i < positions.size(); ++i) {
+		const Vector3i pos(
+				Math::floor(positions[i].x), Math::floor(positions[i].y), Math::floor(positions[i].z)
+		);
+		data.try_set_voxel_f(sdf_values[i], pos, VoxelBuffer::CHANNEL_DATA5);
+	}
+
+	// Padding so neighbor blocks at the seam regenerate their meshes (matches paint_voxels_material).
+	// emit_area_edited = false: remesh the water surface, but do not notify the terrain-edit
+	// consumers (see the function comment).
+	ERR_FAIL_COND(_terrain == nullptr);
+	_terrain->post_edit_area(box.padded(2), true, false);
+}
+
+// Batched terrain-surface query: for each input column, searches CHANNEL_SDF downward from a
+// start Y and returns the sub-voxel terrain top (the SDF zero-crossing between the first solid
+// voxel sdf<=0 and the air voxel directly above it), in voxel-Y units. Columns with no ground
+// within the search depth return NAN. This is the read-side counterpart of set_voxels_fluid_sdf
+// and mirrors VoxelEdits.TryFindGroundY's interpolation, but batched: one editability check and
+// one pre_generate over the bounding box, then plain per-column SDF reads (no _post_edit, this
+// is a pure read).
+//
+// Used by the fluid simulator to anchor the water surface to the terrain (water top = terrain
+// top + fill height, capped at +1 voxel) instead of to a quantized water level.
+//
+// columns: one Vector3(x_voxel, start_y_voxel, z_voxel) per column (x/z floored to voxel
+// indices, start_y is the search start). search_depth is the number of voxel steps to scan
+// downward. Returns one float per column in the same order.
+PackedFloat32Array VoxelToolLodTerrain::get_column_terrain_tops(PackedVector3Array columns, int search_depth) {
+	ZN_PROFILE_SCOPE();
+	PackedFloat32Array result;
+	ERR_FAIL_COND_V(_terrain == nullptr, result);
+	if (columns.size() == 0) {
+		return result;
+	}
+	if (search_depth < 1) {
+		search_depth = 1;
+	}
+
+	// Bounding box over all (x, [start_y-search_depth .. start_y], z), so a single pre_generate
+	// covers every voxel the per-column scans will touch (plus one above for the interpolation).
+	Vector3i min_pos(
+			Math::floor(columns[0].x),
+			Math::floor(columns[0].y) - (search_depth - 1),
+			Math::floor(columns[0].z)
+	);
+	Vector3i max_pos(
+			Math::floor(columns[0].x),
+			Math::floor(columns[0].y) + 1,
+			Math::floor(columns[0].z)
+	);
+	for (int i = 0; i < columns.size(); ++i) {
+		const int x = Math::floor(columns[i].x);
+		const int sy = Math::floor(columns[i].y);
+		const int z = Math::floor(columns[i].z);
+		min_pos = min_pos.min(Vector3i(x, sy - (search_depth - 1), z));
+		max_pos = max_pos.max(Vector3i(x, sy + 1, z));
+	}
+
+	const Box3i box = Box3i::from_min_max(min_pos, max_pos + Vector3i(1, 1, 1)).clipped(_terrain->get_voxel_bounds());
+
+	// Editability gate BEFORE pre_generate_box: without it, pre_generate_box would lazily
+	// allocate and generate data blocks for any part of the box that is not streamed in, both
+	// wasting memory and returning fabricated terrain tops instead of "unknown". If the box is
+	// not fully loaded, return all-NAN so the caller falls back per column (same as no ground
+	// found) rather than reading made-up data.
+	if (!is_area_editable(box)) {
+		result.resize(columns.size());
+		for (int i = 0; i < columns.size(); ++i) {
+			result.write[i] = NAN;
+		}
+		return result;
+	}
+
+	VoxelData &data = _terrain->get_storage();
+	data.pre_generate_box(box);
+
+	VoxelSingleValue defval;
+	defval.f = constants::SDF_FAR_OUTSIDE;
+
+	result.resize(columns.size());
+	for (int i = 0; i < columns.size(); ++i) {
+		const int probe_x = Math::floor(columns[i].x);
+		const int start_vy = Math::floor(columns[i].y);
+		const int probe_z = Math::floor(columns[i].z);
+
+		float ground = NAN;
+		// SDF of the voxel directly above the current probe, carried across iterations so the
+		// zero-crossing can be interpolated without re-reading. NAN until the first probe is read.
+		float sdf_above = NAN;
+		for (int dy = 0; dy < search_depth; ++dy) {
+			const int vy = start_vy - dy;
+			const float sdf = data.get_voxel(Vector3i(probe_x, vy, probe_z), VoxelBuffer::CHANNEL_SDF, defval).f;
+			if (sdf <= 0.0f) {
+				// First solid voxel. Surface lies between vy (sdf<=0) and vy+1 (sdf_above>0).
+				if (math::is_nan(sdf_above)) {
+					sdf_above = data.get_voxel(Vector3i(probe_x, vy + 1, probe_z), VoxelBuffer::CHANNEL_SDF, defval).f;
+				}
+				// Linear zero-crossing in voxel-Y: vy + sdf / (sdf - sdf_above). With sdf<=0 and
+				// sdf_above>0 the denominator is negative and the fraction lies in [0,1), placing
+				// the crossing between vy and vy+1. Falls back to the voxel top if the pair is not
+				// a clean sign change.
+				const float denom = sdf - sdf_above;
+				const float frac = (sdf_above > 0.0f && denom != 0.0f)
+						? math::clamp(sdf / denom, 0.0f, 1.0f)
+						: 1.0f;
+				ground = float(vy) + frac;
+				break;
+			}
+			sdf_above = sdf;
+		}
+		result.write[i] = ground;
+	}
+
+	return result;
+}
+
 // Shared pipeline for the fluid-channel sphere edits. Identical to do_sphere() but with the
 // channel hardcoded to CHANNEL_DATA5 and the mode passed in, so the public methods do not
 // depend on VoxelTool::set_channel / set_mode state and cannot accidentally write to the
@@ -1174,6 +1352,13 @@ void VoxelToolLodTerrain::_bind_methods() {
 	ClassDB::bind_method(
 			D_METHOD("do_sphere_fluid_remove", "center", "radius"), &Self::do_sphere_fluid_remove
 	);
+	ClassDB::bind_method(
+			D_METHOD("set_voxels_fluid_sdf", "positions", "sdf_values"), &Self::set_voxels_fluid_sdf
+	);
+	ClassDB::bind_method(
+			D_METHOD("get_column_terrain_tops", "columns", "search_depth"), &Self::get_column_terrain_tops
+	);
+	ClassDB::bind_method(D_METHOD("try_load_area_editable", "box"), &Self::try_load_area_editable);
 #ifdef VOXEL_ENABLE_MESH_SDF
 	ClassDB::bind_method(D_METHOD("stamp_sdf", "mesh_sdf", "transform", "isolevel", "sdf_scale"), &Self::stamp_sdf);
 #endif

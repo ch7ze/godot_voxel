@@ -147,7 +147,11 @@ public:
 	bool get_cache_generated_blocks() const;
 
 	// These must be called after an edit
-	void post_edit_area(Box3i p_box, bool update_mesh);
+	// emit_area_edited == false suppresses the `area_edited` signal while keeping the remesh
+	// marking. Used by the fluid SDF batch write path (CHANNEL_DATA5), whose changes must
+	// remesh the water surface but must NOT trigger the area_edited consumers (multiplayer
+	// diff broadcast, pathfinder cache invalidation) -- those react to terrain channels only.
+	void post_edit_area(Box3i p_box, bool update_mesh, bool emit_area_edited = true);
 	void post_edit_modifiers(Box3i p_voxel_box);
 
 	// TODO This still sucks atm cuz the edit will still run on the main thread

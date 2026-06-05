@@ -703,6 +703,94 @@ void VoxelData::pre_generate_box(Box3i voxel_box) {
 	);
 }
 
+bool VoxelData::try_load_area(Box3i voxel_box) {
+	ZN_PROFILE_SCOPE();
+
+	// Editing needs the area loaded at LOD0 AND at every higher LOD: after the edit, update_lods()
+	// cascades the change up the mip pyramid and, under streaming, EXPECTS every destination LOD
+	// block to already exist (voxel_data.cpp: "Destination block ... not found when cascading edits
+	// on LOD N"). Loading only LOD0 made the edit's is_area_editable pass but then spammed that
+	// error and left the higher LODs inconsistent. So all LODs of the box are ensured here.
+	//
+	// LOD0 is loaded stream-first (a saved block must come from the stream, not be regenerated, or
+	// saved edits would be lost). Higher LODs are generated: they are not stored individually in the
+	// stream but derived from LOD0 (same as the regular mip path and pre_generate_box).
+	const unsigned int data_block_size = get_block_size();
+	const unsigned int data_block_size_po2 = get_block_size_po2();
+	const unsigned int lod_count = get_lod_count();
+	const Box3i bounds = get_bounds();
+	const Vector3i block_size = Vector3iUtil::create(data_block_size);
+	const VoxelFormat format = get_format();
+	Ref<VoxelStream> stream = get_stream();
+	Ref<VoxelGenerator> generator = get_generator();
+
+	bool ok = true;
+
+	for (unsigned int lod_index = 0; lod_index < lod_count; ++lod_index) {
+		Lod &data_lod = _lods[lod_index];
+		// Box of blocks at this LOD covering the area (each LOD has coarser blocks).
+		const Box3i block_box = voxel_box.clipped(bounds).downscaled(data_block_size << lod_index);
+
+		block_box.for_each_cell([&](Vector3i block_pos) {
+			// Fast pre-check: skip blocks that already carry voxel data (already streamed in /
+			// edited). A bare existing block without voxels (viewer/cache slot) is NOT skipped --
+			// it is filled below. The authoritative check is repeated under the write lock.
+			{
+				RWLockRead rlock(data_lod.map_lock);
+				const VoxelDataBlock *existing = data_lod.map.get_block(block_pos);
+				if (existing != nullptr && existing->has_voxels()) {
+					return;
+				}
+			}
+
+			std::shared_ptr<VoxelBuffer> voxels = make_shared_instance<VoxelBuffer>(VoxelBuffer::ALLOCATOR_POOL);
+			voxels->create(block_size, &format);
+
+			// Origin of this block in voxels: block_pos << (lod_index + block_size_po2).
+			const Vector3i origin_in_voxels = block_pos << (lod_index + data_block_size_po2);
+
+			// LOD0 only: consult the stream first so saved edits are preserved. Higher LODs are
+			// always generated (not stored per-LOD in the stream).
+			VoxelStream::ResultCode result = VoxelStream::RESULT_BLOCK_NOT_FOUND;
+			if (lod_index == 0 && stream.is_valid()) {
+				VoxelStream::VoxelQueryData q{ *voxels, block_pos, 0, VoxelStream::RESULT_ERROR };
+				stream->load_voxel_block(q);
+				result = q.result;
+			}
+
+			if (result == VoxelStream::RESULT_ERROR) {
+				// Leave the block unloaded; the edit's editability check will then abort rather than
+				// operate on undefined data.
+				ok = false;
+				return;
+			}
+
+			if (result == VoxelStream::RESULT_BLOCK_NOT_FOUND && generator.is_valid()) {
+				VoxelGenerator::VoxelQueryData q{ *voxels, origin_in_voxels, lod_index };
+				generator->generate_block(q);
+#ifdef VOXEL_ENABLE_MODIFIERS
+				_modifiers.apply(q.voxel_buffer, AABB(q.origin_in_voxels, q.voxel_buffer.get_size() << lod_index));
+#endif
+			}
+
+			// Insert under the write lock. set_block_buffer creates the block if absent and FILLS an
+			// already-present voxel-less block (overwrite=true -> set_voxels) -- unlike try_set_block,
+			// which gives up when any block exists and would leave a viewer-slot block without voxels.
+			// Re-check has_voxels() under the lock so a block that gained real (possibly saved/edited)
+			// voxels concurrently is not overwritten.
+			SpatialLock3D::Write swlock(data_lod.spatial_lock, Box3i(block_pos, Vector3i(1, 1, 1)));
+			RWLockWrite wlock(data_lod.map_lock);
+			const VoxelDataBlock *existing = data_lod.map.get_block(block_pos);
+			if (existing != nullptr && existing->has_voxels()) {
+				return;
+			}
+			data_lod.map.set_block_buffer(block_pos, voxels, true);
+		});
+	}
+
+	return ok;
+}
+
 void VoxelData::clear_cached_blocks_in_voxel_area(Box3i p_voxel_box) {
 	const unsigned int lod_count = get_lod_count();
 

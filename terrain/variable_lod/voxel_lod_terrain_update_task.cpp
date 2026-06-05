@@ -647,15 +647,15 @@ void VoxelLodTerrainUpdateTask::flush_pending_lod_edits(
 		state.edit_notifications.edited_voxel_areas_lod0.clear();
 	}
 
-	// Update all data LODs
-	// tls_updated_block_locations.clear();
-	data.update_lods(to_span(tls_modified_lod0_blocks), nullptr);
-
-	// Update affected meshes.
-	// TODO Optimize: trigger mesh updates at LOD0 earlier? There is a bit of latency due to doing all the mipping work
-	// first, and we know the edit happens before mipping anyways
 	const unsigned int lod_count = data.get_lod_count();
-	for (unsigned int lod_index = 0; lod_index < lod_count; ++lod_index) {
+
+	// Schedules mesh updates for every existing mesh block intersecting the edited areas, at one LOD.
+	// Only enqueues into `mesh_blocks_pending_update` (no data reads), so it is safe to run before or
+	// after the data mip update.
+	// tls_modified_voxel_areas_lod0 is thread_local, so it is visible inside the lambda without being
+	// captured (capturing a non-automatic-storage variable triggers a GCC warning).
+	const auto schedule_mesh_updates_for_lod = [&state, mesh_block_size](
+													   unsigned int lod_index) {
 		VoxelLodTerrainUpdateData::Lod &lod = state.lods[lod_index];
 		const int mesh_block_size_at_lod = mesh_block_size << lod_index;
 
@@ -679,6 +679,21 @@ void VoxelLodTerrainUpdateTask::flush_pending_lod_edits(
 				}
 			});
 		}
+	};
+
+	// Schedule the LOD0 remesh BEFORE the data mip update. LOD0 is the visible, edited resolution, and
+	// its mesh task does not depend on the mip pyramid, so enqueuing it first removes the latency of
+	// having to finish all the mipping work before the edit becomes visible (see the former TODO here).
+	schedule_mesh_updates_for_lod(0);
+
+	// Update all data LODs (the mip pyramid). Must run before the higher-LOD mesh tasks are scheduled,
+	// because those read the mipped data.
+	// tls_updated_block_locations.clear();
+	data.update_lods(to_span(tls_modified_lod0_blocks), nullptr);
+
+	// Schedule remeshes for the coarser LODs, now that their data has been mipped.
+	for (unsigned int lod_index = 1; lod_index < lod_count; ++lod_index) {
+		schedule_mesh_updates_for_lod(lod_index);
 	}
 
 	// -- Old logic based solely on updated data blocks, however doesn't account for padding (would have to force-edit

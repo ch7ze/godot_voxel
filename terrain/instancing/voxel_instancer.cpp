@@ -2520,6 +2520,16 @@ void VoxelInstancer::remove_floating_instances(const Box3i p_voxel_box) {
 								mm_item = Object::cast_to<VoxelInstanceLibraryMultiMeshItem>(item);
 							}
 
+							// A layer is either multimesh or scene. The block has no scene instances
+							// here, but the layer item can still be a scene item (a scene-item block
+							// simply has zero instances right now) -- in that case the cast yields null
+							// and there are no multimesh instances to remove, so skip the multimesh
+							// removal path instead of calling get_mm_removal_action with null (which
+							// previously logged "Didn't expect multimesh item to be null").
+							if (mm_item == nullptr) {
+								continue;
+							}
+
 							MMRemovalAction action = get_mm_removal_action(this, mm_item);
 
 							remove_floating_multimesh_instances(

@@ -439,6 +439,31 @@ void FastNoise2::get_noise_3d_grid(Vector3 origin, Vector3i size, Span<float> ds
 	_generator->GenUniformGrid3D(dst.data(), origin.x, origin.y, origin.z, size.x, size.y, size.z, 1.f, _seed);
 }
 
+PackedFloat32Array FastNoise2::get_noise_3d_grid_packed(Vector3 origin, Vector3i size, float stride) const {
+	PackedFloat32Array result;
+	ERR_FAIL_COND_V(!is_valid(), result);
+	ERR_FAIL_COND_V(!math::is_valid_size(size), result);
+	const int64_t count = int64_t(size.x) * int64_t(size.y) * int64_t(size.z);
+	ERR_FAIL_COND_V(count <= 0, result);
+	result.resize(count);
+	// GenUniformGrid3D samples coordinate (start + i) * frequency along each axis (the period set via
+	// set_period is applied separately, as a DomainScale node inside the generator). To sample world
+	// position `origin + i * stride` -- i.e. a LOD block whose voxels are `stride = 1 << lod` apart --
+	// the grid start is origin / stride and the per-step frequency is `stride`:
+	//     (origin/stride + i) * stride == origin + i * stride.
+	// This is exact when origin is a multiple of stride, which always holds for block origins (block
+	// origin in voxel indices is aligned to block_size << lod). Falling back to round keeps it safe if
+	// a non-aligned origin is ever passed.
+	ERR_FAIL_COND_V(stride <= 0.f, result);
+	const int start_x = int(Math::round(origin.x / stride));
+	const int start_y = int(Math::round(origin.y / stride));
+	const int start_z = int(Math::round(origin.z / stride));
+	_generator->GenUniformGrid3D(
+			result.ptrw(), start_x, start_y, start_z, size.x, size.y, size.z, stride, _seed
+	);
+	return result;
+}
+
 void FastNoise2::get_noise_2d_grid_tileable(Vector2i size, Span<float> dst) const {
 	ERR_FAIL_COND(!is_valid());
 	ERR_FAIL_COND(size.x < 0 || size.y < 0);
@@ -683,6 +708,10 @@ void FastNoise2::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("get_noise_2d_single", "pos"), &FastNoise2::get_noise_2d_single);
 	ClassDB::bind_method(D_METHOD("get_noise_3d_single", "pos"), &FastNoise2::get_noise_3d_single);
+	ClassDB::bind_method(
+			D_METHOD("get_noise_3d_grid_packed", "origin", "size", "stride"),
+			&FastNoise2::get_noise_3d_grid_packed
+	);
 
 	ClassDB::bind_method(D_METHOD("generate_image", "image", "tileable"), &FastNoise2::generate_image);
 

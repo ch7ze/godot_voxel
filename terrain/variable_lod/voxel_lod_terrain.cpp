@@ -676,7 +676,7 @@ void VoxelLodTerrain::set_mesh_block_visual_active(
 
 // Marks intersecting blocks in the area as modified, updates LODs and schedules remeshing.
 // The provided box must be at LOD0 coordinates.
-void VoxelLodTerrain::post_edit_area(Box3i p_box, bool update_mesh) {
+void VoxelLodTerrain::post_edit_area(Box3i p_box, bool update_mesh, bool emit_area_edited) {
 	ZN_PROFILE_SCOPE();
 	{
 		MutexLock lock(_update_data->state.edit_notifications.mutex);
@@ -696,7 +696,9 @@ void VoxelLodTerrain::post_edit_area(Box3i p_box, bool update_mesh) {
 	}
 #endif
 
-	emit_signal(VoxelStringNames::get_singleton().area_edited, p_box.position, p_box.size);
+	if (emit_area_edited) {
+		emit_signal(VoxelStringNames::get_singleton().area_edited, p_box.position, p_box.size);
+	}
 
 #ifdef TOOLS_ENABLED
 	// This is a workaround for a defect in the LegacyOctree streaming system:

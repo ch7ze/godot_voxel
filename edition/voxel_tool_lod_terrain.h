@@ -98,6 +98,25 @@ public:
 	void do_sphere_fluid_add(Vector3 center, float radius);
 	void do_sphere_fluid_remove(Vector3 center, float radius);
 
+	// Batch-writes fluid SDF values into CHANNEL_DATA5 for a list of individual voxels with a
+	// single editability check, a single remesh, and WITHOUT emitting `area_edited`. Bulk path
+	// for the fluid simulator's per-tick surface band. positions are voxel indices; sdf_values
+	// must match positions in length. See the .cpp for the rationale on suppressing the signal.
+	// Synchronously streams in / generates the LOD0 data blocks overlapping the given world-space
+	// AABB so the area becomes editable, then returns whether it is now editable. Lets callers edit
+	// areas the viewers have not streamed in yet (e.g. deep caves) without permanently raising the
+	// LOD0 load radius. Mirrors the Aabb->Box3i convention of is_area_editable. Returns false if the
+	// stream errored (the area then stays non-editable). See VoxelData::try_load_area for details.
+	bool try_load_area_editable(AABB box);
+
+	void set_voxels_fluid_sdf(PackedVector3Array positions, PackedFloat32Array sdf_values);
+
+	// Batched terrain-surface query (read-side counterpart of set_voxels_fluid_sdf). For each
+	// column Vector3(x_voxel, start_y_voxel, z_voxel) returns the sub-voxel terrain top in
+	// voxel-Y (SDF zero-crossing), or NAN if no ground was found within search_depth voxel
+	// steps. One pre_generate over the bounding box, then per-column SDF reads (pure read).
+	PackedFloat32Array get_column_terrain_tops(PackedVector3Array columns, int search_depth);
+
 	// TODO GDX: it seems binding a method taking a `Node*` fails to compile. It is supposed to be working.
 #if defined(ZN_GODOT)
 	Array separate_floating_chunks(AABB world_box, Node *parent_node);

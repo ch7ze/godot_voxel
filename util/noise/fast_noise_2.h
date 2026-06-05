@@ -197,6 +197,15 @@ public:
 	void get_noise_2d_grid(Vector2 origin, Vector2i size, Span<float> dst) const;
 	void get_noise_3d_grid(Vector3 origin, Vector3i size, Span<float> dst) const;
 
+	// C#-reachable wrapper around get_noise_3d_grid: samples a regular 3D grid in one SIMD batch
+	// and returns it as a PackedFloat32Array (the Span-based get_noise_3d_grid is not bindable).
+	// `stride` is the world-space distance between adjacent samples along each axis, so a LOD block
+	// can pass its voxel step (1 << lod) to sample at the right scale; `origin` is the world-space
+	// position of sample (0,0,0). Layout matches get_noise_3d_grid: index = x + size.x*(y +
+	// size.y*z). Lets HybridTestGenerator carve caves with one batched call per block instead of a
+	// per-voxel get_noise_3d_single from C#.
+	PackedFloat32Array get_noise_3d_grid_packed(Vector3 origin, Vector3i size, float stride) const;
+
 	void get_noise_2d_grid_tileable(Vector2i size, Span<float> dst) const;
 
 	void generate_image(Ref<Image> image, bool tileable) const;
