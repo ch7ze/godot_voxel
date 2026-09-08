@@ -304,16 +304,19 @@ void VoxelMesherHybrid::update_lod_material_colors() const {
 	if (_default_lod_material.is_null()) {
 		return;
 	}
-	// u_material_colors is a fixed-size shader array (MATERIAL_COLOR_COUNT == 8).
-	// Index 0 is the smooth terrain; indices 1.. are the model colors. The shader clamps the
-	// per-vertex id into range, so providing fewer colors than slots is safe.
+	// u_material_colors is a fixed-size shader array (MATERIAL_COLOR_COUNT == 8), indexed
+	// directly by the per-vertex material id the surfaces emit: 0 = smooth terrain, 1 = smooth
+	// water, 2.. = model surfaces (surface id = 2 + library material id, see
+	// build_model_surface). _model_colors uses the SAME surface-id indexing -- slot 0 is unused
+	// because the terrain colour wins there -- so no offset is applied between the array and the
+	// vertex ids. The shader clamps the per-vertex id into range, so providing fewer colors than
+	// slots is safe.
 	constexpr int MATERIAL_COLOR_COUNT = 8;
 	Array colors;
 	colors.resize(MATERIAL_COLOR_COUNT);
 	colors[0] = _terrain_color;
 	for (int i = 1; i < MATERIAL_COLOR_COUNT; ++i) {
-		const int model_index = i - 1;
-		colors[i] = model_index < _model_colors.size() ? _model_colors[model_index] : Color(1, 1, 1);
+		colors[i] = i < _model_colors.size() ? _model_colors[i] : Color(1, 1, 1);
 	}
 	_default_lod_material->set_shader_parameter("u_material_colors", colors);
 }

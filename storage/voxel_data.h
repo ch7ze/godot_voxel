@@ -165,14 +165,17 @@ public:
 	// WARNING: this does not check if the area is editable.
 	void pre_generate_box(Box3i voxel_box);
 
-	// Synchronously loads all LOD0 data blocks of the box that are not already loaded, so the area
+	// Synchronously loads all data blocks of the box that are not already loaded, at EVERY LOD
+	// (editing also needs the higher LODs so update_lods can cascade the edit), so the area
 	// becomes editable (is_area_loaded() returns true afterwards). Unlike pre_generate_box, which
 	// deliberately skips non-loaded blocks under streaming (to avoid fabricating data over possibly
-	// saved edits), this consults the stream first: a block found in the stream is loaded from it
-	// (preserving saved edits), a block reported NOT_FOUND is filled by the generator, and the
-	// result is inserted into LOD0 via try_set_block. Intended for on-demand editing of areas the
-	// viewers have not streamed in yet (e.g. deep caves below the surface). Returns false if the
-	// stream reported an error for any block (the area is then left as-is and stays non-editable).
+	// saved edits), LOD0 consults the stream first: a block found in the stream is loaded from it
+	// (preserving saved edits), a block reported NOT_FOUND is filled by the generator. Higher LODs
+	// are always generated (they are not stored per-LOD in the stream). The result is inserted via
+	// set_block_buffer, which also fills an already-present voxel-less block (e.g. a viewer slot).
+	// Intended for on-demand editing of areas the viewers have not streamed in yet (e.g. deep
+	// caves below the surface). Returns false if the stream reported an error for any block (the
+	// area is then left as-is and stays non-editable).
 	// Runs sequentially and locks data per block; may block other threads touching the same data.
 	bool try_load_area(Box3i voxel_box);
 

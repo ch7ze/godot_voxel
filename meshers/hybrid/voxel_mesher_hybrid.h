@@ -38,8 +38,9 @@ public:
 
 	bool is_generating_collision_surface() const override;
 
-	// Provides the material for each surface index. Index 0 is the smooth terrain;
-	// indices >= 1 map to the model library's materials (index 1 -> library material 0, etc.).
+	// Provides the material for each surface index. Index 0 is the smooth terrain, index 1 the
+	// smooth water surface; indices >= 2 map to the model library's materials
+	// (index 2 -> library material 0, etc.).
 	// The terrain calls this per chunk surface to assign materials.
 	Ref<Material> get_material_by_index(unsigned int index) const override;
 	unsigned int get_material_index_count() const override;
@@ -86,8 +87,10 @@ public:
 
 	// Colours used by the default LOD shader (get_default_lod_material). The shader picks a
 	// colour per vertex from the CUSTOM1 material id: id 0 -> terrain_color, id N>=1 ->
-	// model_colors[N-1]. These are independent of terrain_material/model_material, which only
-	// apply when the terrain is rendered without the default LOD shader.
+	// model_colors[N]. model_colors is indexed by surface material id (slot 1 = water,
+	// slots 2.. = library materials at 2 + library material id; slot 0 is unused because the
+	// terrain colour wins there). These are independent of terrain_material/model_material,
+	// which only apply when the terrain is rendered without the default LOD shader.
 	void set_terrain_color(Color color);
 	Color get_terrain_color() const;
 

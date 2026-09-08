@@ -296,12 +296,35 @@ void VoxelToolLodTerrain::do_flat_path(
 	}
 	const int64_t segment_count = point_count - 1;
 
-	// Per-segment XZ bounding boxes (widened by reach), used to skip segments that cannot affect a
-	// given column. reach is the largest XZ distance at which a column still gets a non-zero weight:
-	// half_width (full strip) plus the WIDER of the height/material soft shoulders plus a 1-voxel
-	// guard. The material edge can be wider than the height edge, and the box must cover it so the
-	// outer asphalt columns (paint weight > 0 but no height shift) are not clipped away.
-	const float reach = half_width_local + math::max(edge_softness, paint_edge_softness) + 1.0f;
+	// Build the shared road profile: the SINGLE definition of the road's shape (segments), height rise
+	// and material feathering. The same struct drives apply_road_profile_to_buffer in the generator, so
+	// the road is identical whether built here (post-generation edit) or there (during generation).
+	// half_height is unused for the height-field application (the SDF subtraction is a column offset, not
+	// a slab), so the segments only carry the XZ footprint; half_height/sdf_scale are left at neutral.
+	StdVector<ops::SdfFlatPathSegment> profile_segments;
+	profile_segments.resize(segment_count);
+	for (int64_t i = 0; i < segment_count; ++i) {
+		ops::SdfFlatPathSegment seg;
+		seg.a = pts[i];
+		seg.b = pts[i + 1];
+		seg.half_width = half_width_local;
+		seg.half_height = 0.f;
+		seg.sdf_scale = 1.f;
+		profile_segments[i] = seg;
+	}
+	ops::VoxelRoadProfile profile;
+	profile.segments = to_span(profile_segments);
+	profile.half_width = half_width_local;
+	profile.height_shift = height_shift;
+	profile.edge_softness = edge_softness;
+	profile.paint_edge_softness = paint_edge_softness;
+	profile.material_index = paint_material ? material_index : -1;
+
+	// Per-segment XZ bounding boxes (widened by the profile's reach = half_width + the WIDER of the
+	// height/material shoulders + 1), used to skip segments that cannot affect a given column. The
+	// pruning data is passed to VoxelRoadProfile::column_dist_xz, the single distance definition shared
+	// with the generator, so the outer asphalt columns (paint weight > 0, no height shift) are covered.
+	const float reach = profile.reach();
 	StdVector<float> seg_minx, seg_maxx, seg_minz, seg_maxz;
 	seg_minx.resize(segment_count);
 	seg_maxx.resize(segment_count);
@@ -322,26 +345,11 @@ void VoxelToolLodTerrain::do_flat_path(
 	// half_width (smoothstep on the XZ distance to the NEAREST segment), giving a flat crown that
 	// blends into the terrain without a step.
 
-	// XZ distance from a column (x,z) to the whole polyline (minimum over segments), pruned by each
-	// segment's XZ bounding box so far-away segments are skipped. dist_xz only reads a/b in XZ, so
-	// the Y of the probe point is irrelevant -- passed as 0.
+	// XZ distance from a column to the whole polyline, using the shared profile (pruned by the
+	// per-segment boxes above). The profile is the single definition of the road footprint.
 	auto column_dist_xz = [&](float x, float z) -> float {
-		const Vector3f p(x, 0.f, z);
-		float best = constants::SDF_FAR_OUTSIDE;
-		for (int64_t i = 0; i < segment_count; ++i) {
-			if (x < seg_minx[i] || x > seg_maxx[i] || z < seg_minz[i] || z > seg_maxz[i]) {
-				continue; // column outside this segment's reach
-			}
-			ops::SdfFlatPathSegment seg;
-			seg.a = pts[i];
-			seg.b = pts[i + 1];
-			float t;
-			const float d = seg.dist_xz(p, t);
-			if (d < best) {
-				best = d;
-			}
-		}
-		return best;
+		return profile.column_dist_xz(x, z,
+				to_span(seg_minx), to_span(seg_maxx), to_span(seg_minz), to_span(seg_maxz));
 	};
 
 	// Single box over the whole trace. XZ widened by reach; vertical span widened by vertical_margin
@@ -385,11 +393,9 @@ void VoxelToolLodTerrain::do_flat_path(
 		for (int x = min_pos.x; x < max_pos.x; ++x) {
 			const float d_xz = column_dist_xz(float(x), float(z)) - half_width_local;
 
-			// Height shift weight: 1 inside the strip, smoothly to 0 over edge_softness past the edge.
-			const float w = 1.0f - math::smoothstep(0.0f, edge_softness, d_xz);
-			// Material paint weight: same shape but over the (possibly wider) paint_edge_softness, so
-			// the asphalt weight spreads across more cells than the height feather for a straight edge.
-			const float w_paint = paint_material ? (1.0f - math::smoothstep(0.0f, paint_edge_softness, d_xz)) : 0.0f;
+			// Height + material weights from the SHARED profile (same definition the generator uses).
+			const float w = profile.height_weight_from_dist(d_xz);
+			const float w_paint = profile.paint_weight_from_dist(d_xz);
 			// Skip the column only if it affects neither the height nor the material.
 			if (w <= 0.0f && w_paint <= 0.0f) {
 				continue;

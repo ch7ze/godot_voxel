@@ -8,8 +8,9 @@ shader_type spatial;
 //  1. Transvoxel LOD transition handling (identical to transvoxel_minimal):
 //     reads CUSTOM0 to move/cull the transition vertices of surface 0.
 //  2. Per-voxel material colour: reads a material id from CUSTOM1.r and picks
-//     a colour from u_material_colors. Id 0 is the smooth terrain, ids >= 1 are
-//     the blocky model materials (id = 1 + library material id).
+//     a colour from u_material_colors. Id 0 is the smooth terrain, id 1 the
+//     smooth water surface, ids >= 2 are the blocky model materials
+//     (id = 2 + library material id).
 //
 // Both the smooth surface and the model surfaces carry CUSTOM0 and CUSTOM1, so
 // every surface has the same vertex format and this one shader renders them all.
@@ -18,7 +19,7 @@ shader_type spatial;
 uniform int u_transition_mask;
 
 // Colour table indexed by the per-vertex material id in CUSTOM1.r.
-// Index 0 = smooth terrain, index 1.. = model materials.
+// Index 0 = smooth terrain, index 1 = water, index 2.. = model materials.
 const int MATERIAL_COLOR_COUNT = 8;
 uniform vec4 u_material_colors[MATERIAL_COLOR_COUNT];
 uniform float u_roughness = 1.0;

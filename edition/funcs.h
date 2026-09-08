@@ -516,6 +516,83 @@ struct SdfFlatPathSegment {
 	}
 };
 
+// SINGLE SOURCE OF TRUTH for a road's shape, height rise and material along a polyline. Both the
+// post-generation edit (VoxelToolLodTerrain::do_flat_path) and the in-generation application
+// (VoxelToolLodTerrain::apply_road_profile_to_buffer, called by the procedural generator) use this
+// struct, so a road looks identical no matter when it is created and no part of the definition is
+// duplicated.
+//
+// The profile is a pure function of an XZ column: it returns the height-rise weight w (1 in the strip,
+// feathered to 0 over the shoulder) and the material paint weight w_paint (same shape, possibly wider
+// shoulder). HOW those weights are applied differs per context and is NOT part of this struct:
+//   - do_flat_path lowers the existing SDF by height_shift * w (raising the iso-surface).
+//   - the generator adds height_shift * w to the column height before sdf = worldY - height.
+// Both are the same continuous height-field offset (see do_flat_path's comment on SDF linearity).
+//
+// All distances/extents are in the SAME space as the segment points (voxel-local for do_flat_path,
+// voxel-index for the generator). The caller scales world meters into that space before filling this.
+struct VoxelRoadProfile {
+	Span<const SdfFlatPathSegment> segments; // road centre polyline as flat-path segments (XZ distance)
+	float half_width; // road half-width (full-weight strip half-extent)
+	float height_shift; // height the iso-surface rises inside the strip (same space as the SDF/height)
+	float edge_softness; // shoulder width for the HEIGHT feather (>= small epsilon)
+	float paint_edge_softness; // shoulder width for the MATERIAL feather (>= edge_softness, wider edge)
+	int material_index; // Mixel4 material to paint; < 0 = do not touch material channels
+
+	// Largest XZ distance from a segment at which a column still gets a non-zero height OR paint weight:
+	// half_width plus the wider of the two shoulders plus a 1-unit guard. Used to prune the affected box.
+	inline float reach() const {
+		return half_width + math::max(edge_softness, paint_edge_softness) + 1.0f;
+	}
+
+	// Minimum XZ distance from column (x,z) to the road polyline (over all segments). Y is irrelevant
+	// to the footprint, so it is ignored. Optional per-segment XZ bounding boxes (each widened by
+	// reach()) prune segments that cannot affect the column; pass empty spans to skip pruning. The
+	// box spans must either be empty or have one entry per segment.
+	inline float column_dist_xz(
+			float x,
+			float z,
+			Span<const float> seg_minx,
+			Span<const float> seg_maxx,
+			Span<const float> seg_minz,
+			Span<const float> seg_maxz) const {
+		const bool prune = seg_minx.size() == segments.size();
+		const Vector3f p(x, 0.f, z);
+		float best = 1e30f;
+		for (unsigned int i = 0; i < segments.size(); ++i) {
+			if (prune && (x < seg_minx[i] || x > seg_maxx[i] || z < seg_minz[i] || z > seg_maxz[i])) {
+				continue; // column outside this segment's reach
+			}
+			float t;
+			const float d = segments[i].dist_xz(p, t);
+			if (d < best) {
+				best = d;
+			}
+		}
+		return best;
+	}
+
+	// Convenience overload without pruning (small segment counts, e.g. one block's worth of road).
+	inline float column_dist_xz(float x, float z) const {
+		return column_dist_xz(x, z, Span<const float>(), Span<const float>(), Span<const float>(), Span<const float>());
+	}
+
+	// Height-rise weight at column (x,z): 1 inside the strip, smoothstep to 0 over edge_softness past
+	// the strip edge. d_xz may be passed in if already computed (avoids recomputing for the paint
+	// weight); pass a negative sentinel to compute it here.
+	inline float height_weight_from_dist(float d_xz_minus_halfwidth) const {
+		return 1.0f - math::smoothstep(0.0f, edge_softness, d_xz_minus_halfwidth);
+	}
+
+	// Material paint weight at column (x,z): same shape over the (possibly wider) paint shoulder.
+	inline float paint_weight_from_dist(float d_xz_minus_halfwidth) const {
+		if (material_index < 0) {
+			return 0.0f;
+		}
+		return 1.0f - math::smoothstep(0.0f, paint_edge_softness, d_xz_minus_halfwidth);
+	}
+};
+
 struct SdfRoundCone {
 	math::SdfRoundConePrecalc<float> cone;
 	float sdf_scale;

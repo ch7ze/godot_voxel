@@ -1,5 +1,6 @@
 #include "voxel_tool.h"
 
+#include "../storage/mixel4.h"
 #include "../storage/voxel_buffer_gd.h"
 #include "../storage/voxel_data.h"
 #include "../util/godot/core/packed_arrays.h"
@@ -719,6 +720,121 @@ Color _b_normalize_color(Color c) {
 	}
 	return c / sum;
 }
+
+// Applies a road profile directly into a freshly generated VoxelBuffer (the in-generation path),
+// using the SAME ops::VoxelRoadProfile definition as do_flat_path -- so a generator road and a
+// player/UI road have identical shape, height rise and material, with no duplicated road logic.
+//
+// Coordinates: `segment_points` holds INDEPENDENT segments as point PAIRS in VOXEL-INDEX (world)
+// space: points (2i, 2i+1) are segment i's endpoints. Independent pairs (not one connected polyline)
+// let the generator pass ALL grid lines crossing a block in ONE call -- VoxelRoadProfile takes the
+// min distance over all segments, so unconnected lines never get joined by a diagonal. `origin_in_voxels`
+// is the buffer's world-voxel origin and `lod_step` the voxel stride per buffer cell, so cell (x,y,z)
+// maps to world voxel origin + cell*lod_step. All profile extents are in voxel-index units too.
+//
+// Height application matches do_flat_path EXACTLY: the buffer's SDF is the linear height field
+// sdf = worldY - height, so subtracting height_shift * w from a column raises the iso-surface by that
+// amount. The material is blended with mixel4::blend_texture_packed_u16 (same as do_flat_path).
+void _b_apply_road_profile_to_buffer(
+		Ref<godot::VoxelBuffer> buffer,
+		Vector3i origin_in_voxels,
+		int lod_step,
+		PackedVector3Array segment_points,
+		float half_width,
+		float thickness,
+		float smoothness,
+		int material_index,
+		float paint_smoothness) {
+	ERR_FAIL_COND(buffer.is_null());
+	ERR_FAIL_COND(segment_points.size() < 2);
+	ERR_FAIL_COND(material_index >= 256);
+	ERR_FAIL_COND(lod_step < 1);
+
+	zylann::voxel::VoxelBuffer &vb = buffer->get_buffer();
+	const Vector3i size = vb.get_size();
+	if (size.x <= 0 || size.y <= 0 || size.z <= 0) {
+		return;
+	}
+
+	const bool paint_material = material_index >= 0;
+	const float edge_softness = math::max(smoothness, 0.01f);
+	const float paint_edge_softness = paint_smoothness > 0.f ? math::max(paint_smoothness, edge_softness) : edge_softness;
+
+	// Build the shared profile from INDEPENDENT segment pairs (already in voxel-index space). An odd
+	// trailing point (size not even) is ignored.
+	const int64_t segment_count = segment_points.size() / 2;
+	StdVector<ops::SdfFlatPathSegment> segs;
+	segs.resize(segment_count);
+	for (int64_t i = 0; i < segment_count; ++i) {
+		const Vector3 a = segment_points[i * 2];
+		const Vector3 b = segment_points[i * 2 + 1];
+		ops::SdfFlatPathSegment seg;
+		seg.a = Vector3f(a.x, a.y, a.z);
+		seg.b = Vector3f(b.x, b.y, b.z);
+		seg.half_width = half_width;
+		seg.half_height = 0.f;
+		seg.sdf_scale = 1.f;
+		segs[i] = seg;
+	}
+	ops::VoxelRoadProfile profile;
+	profile.segments = to_span(segs);
+	profile.half_width = half_width;
+	profile.height_shift = thickness; // 1:1 with do_flat_path (strength == 1 in the generator buffer)
+	profile.edge_softness = edge_softness;
+	profile.paint_edge_softness = paint_edge_softness;
+	profile.material_index = paint_material ? material_index : -1;
+
+	// Per-segment XZ bounding boxes (widened by the profile reach) so the column distance prunes far
+	// segments -- ONE buffer scan handles all grid lines of a block efficiently.
+	const float reach = profile.reach();
+	StdVector<float> seg_minx, seg_maxx, seg_minz, seg_maxz;
+	seg_minx.resize(segment_count);
+	seg_maxx.resize(segment_count);
+	seg_minz.resize(segment_count);
+	seg_maxz.resize(segment_count);
+	for (int64_t i = 0; i < segment_count; ++i) {
+		seg_minx[i] = math::min(segs[i].a.x, segs[i].b.x) - reach;
+		seg_maxx[i] = math::max(segs[i].a.x, segs[i].b.x) + reach;
+		seg_minz[i] = math::min(segs[i].a.z, segs[i].b.z) - reach;
+		seg_maxz[i] = math::max(segs[i].a.z, segs[i].b.z) + reach;
+	}
+
+	const unsigned int sdf_channel = zylann::voxel::VoxelBuffer::CHANNEL_SDF;
+	const unsigned int idx_channel = zylann::voxel::VoxelBuffer::CHANNEL_INDICES;
+	const unsigned int wgt_channel = zylann::voxel::VoxelBuffer::CHANNEL_WEIGHTS;
+
+	// d_xz is Y-independent -> computed once per (x,z) column, reused for the whole vertical span, same
+	// as do_flat_path. Columns with no height and no paint weight are skipped before touching voxels.
+	for (int z = 0; z < size.z; ++z) {
+		const float world_z = float(origin_in_voxels.z + z * lod_step);
+		for (int x = 0; x < size.x; ++x) {
+			const float world_x = float(origin_in_voxels.x + x * lod_step);
+			const float d_xz = profile.column_dist_xz(world_x, world_z,
+					to_span(seg_minx), to_span(seg_maxx), to_span(seg_minz), to_span(seg_maxz)) - half_width;
+			const float w = profile.height_weight_from_dist(d_xz);
+			const float w_paint = profile.paint_weight_from_dist(d_xz);
+			if (w <= 0.0f && w_paint <= 0.0f) {
+				continue;
+			}
+			for (int y = 0; y < size.y; ++y) {
+				if (w > 0.0f) {
+					const float old_sdf = vb.get_voxel_f(x, y, z, sdf_channel);
+					const float new_sdf = old_sdf - profile.height_shift * w;
+					if (new_sdf != old_sdf) {
+						vb.set_voxel_f(new_sdf, x, y, z, sdf_channel);
+					}
+				}
+				if (paint_material && w_paint > 0.0f) {
+					uint32_t encoded_indices = static_cast<uint32_t>(vb.get_voxel(x, y, z, idx_channel));
+					uint16_t encoded_weights = static_cast<uint16_t>(vb.get_voxel(x, y, z, wgt_channel));
+					mixel4::blend_texture_packed_u16(material_index, w_paint, encoded_indices, encoded_weights);
+					vb.set_voxel(encoded_indices, x, y, z, idx_channel);
+					vb.set_voxel(encoded_weights, x, y, z, wgt_channel);
+				}
+			}
+		}
+	}
+}
 } // namespace
 
 void VoxelTool::_b_set_channel(godot::VoxelBuffer::ChannelId p_channel) {
@@ -835,6 +951,17 @@ void VoxelTool::_bind_methods() {
 			VoxelTool::get_class_static(), D_METHOD("u16_weights_to_color"), &_b_u16_weights_to_color
 	);
 	ClassDB::bind_static_method(VoxelTool::get_class_static(), D_METHOD("normalize_color"), &_b_normalize_color);
+
+	// Road profile applied into a freshly generated buffer (in-generation road), sharing the exact
+	// ops::VoxelRoadProfile definition with do_flat_path (post-generation road) so both are identical.
+	ClassDB::bind_static_method(
+			VoxelTool::get_class_static(),
+			D_METHOD("apply_road_profile_to_buffer", "buffer", "origin_in_voxels", "lod_step", "segment_points",
+					"half_width", "thickness", "smoothness", "material_index", "paint_smoothness"),
+			&_b_apply_road_profile_to_buffer,
+			DEFVAL(-1),
+			DEFVAL(-1.0)
+	);
 
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "value"), "set_value", "get_value");
 	ADD_PROPERTY(
