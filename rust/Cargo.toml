@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["voxel-core", "voxel-mesher", "bevy-voxel"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+rust-version = "1.97"
+
+[workspace.dependencies]
+# Pinned to the version bevy_math 0.20.1 depends on, so Vec3 and friends are
+# the same type across all crates. Verified with `cargo tree -i glam@0.33.12`.
+glam = "0.33"
+bevy = "0.20.1"
+voxel-core = { path = "voxel-core" }
+voxel-mesher = { path = "voxel-mesher" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

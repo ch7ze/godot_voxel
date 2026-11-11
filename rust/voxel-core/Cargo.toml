@@ -1,0 +1,10 @@
+[package]
+name = "voxel-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Engine-neutral voxel storage, channels and material packing"
+
+[dependencies]
+glam = { workspace = true }

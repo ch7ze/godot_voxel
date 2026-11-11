@@ -1,0 +1,12 @@
+[package]
+name = "bevy-voxel"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bevy plugin exposing the hybrid voxel mesher"
+
+[dependencies]
+bevy = { workspace = true }
+voxel-core = { workspace = true }
+voxel-mesher = { workspace = true }

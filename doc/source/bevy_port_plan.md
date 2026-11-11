@@ -5,6 +5,20 @@ Stand 2026-11-10. Branch `hybrid-mesher`.
 Alle Dateiangaben beziehen sich auf dieses Repository, alle Zeilenzahlen auf
 `wc -l` zum oben genannten Stand.
 
+> **Umsetzungsstand 2026-11-11.** Der Plan ist umgesetzt, der Code liegt unter
+> `rust/`. Der Fortschritt je Paket samt Abweichungen steht in
+> `bevy_port_todo.md`. Abweichungen gegenueber diesem Plan, jeweils dort
+> begruendet:
+>
+> - Bevy-Zielversion `0.20.1` statt der hier recherchierten 0.18
+> - `glam` im Workspace auf `0.33`, angeglichen an `bevy_math 0.20.1`
+> - P2 als Eigenportierung umgesetzt, der Crate `transvoxel` wird nicht genutzt
+> - P7 als Eigenentwicklung, `bevy_voxel_world` nimmt ueber
+>   `chunk_meshing_delegate` zwar einen Fremdmesher auf, uebergibt jedoch nur
+>   einen Material-Index je Voxel
+> - P8 liegt in `voxel-core` statt in `bevy-voxel`, die Operationen sind
+>   engine-neutral
+
 ---
 
 ## 1. Zielbestimmung und Ist-Stand

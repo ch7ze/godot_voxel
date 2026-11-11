@@ -1,0 +1,11 @@
+[package]
+name = "voxel-mesher"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Engine-neutral hybrid blocky + SDF voxel mesher"
+
+[dependencies]
+glam = { workspace = true }
+voxel-core = { workspace = true }
