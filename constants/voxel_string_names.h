@@ -107,6 +107,9 @@ public:
 	StringName _on_async_search_completed;
 	StringName async_search_completed;
 
+	StringName completed;
+	StringName _emit_completed;
+
 	StringName file_selected;
 
 	StringName jitter;

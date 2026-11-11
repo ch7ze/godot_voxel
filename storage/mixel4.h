@@ -60,9 +60,11 @@ inline constexpr uint16_t encode_weights_to_packed_u16_lossy(uint8_t a, uint8_t 
 	return (a >> 4) | ((b >> 4) << 4) | ((c >> 4) << 8) | ((d >> 4) << 12);
 }
 
-// Checks if there are no duplicate indices in any voxel
+// Checks if there are no duplicate indices in any voxel.
+// The map covers the full 8-bit index range, because index slots hold 0..255 since the Mixel4 index
+// word moved to 8 bits per slot. A 16-entry map would be indexed out of bounds by any index above 15.
 inline void debug_check_texture_indices(FixedArray<uint8_t, 4> indices) {
-	FixedArray<bool, 16> checked;
+	FixedArray<bool, 256> checked;
 	fill(checked, false);
 	for (unsigned int i = 0; i < indices.size(); ++i) {
 		unsigned int ti = indices[i];

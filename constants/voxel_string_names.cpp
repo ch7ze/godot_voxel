@@ -119,6 +119,9 @@ VoxelStringNames::VoxelStringNames() {
 	_on_async_search_completed = StringName("_on_async_search_completed");
 	async_search_completed = StringName("async_search_completed");
 
+	completed = StringName("completed");
+	_emit_completed = StringName("_emit_completed");
+
 	file_selected = StringName("file_selected");
 
 	jitter = StringName("jitter");

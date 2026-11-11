@@ -166,6 +166,8 @@ public:
 	};
 
 	static VoxelEngine &get_singleton();
+	// Lets objects outliving the module, such as RefCounted handles held by scripts, skip engine calls on shutdown
+	static bool has_singleton();
 	static void create_singleton(Config config);
 	static void destroy_singleton();
 

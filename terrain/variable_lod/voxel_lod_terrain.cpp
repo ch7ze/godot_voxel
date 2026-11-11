@@ -127,6 +127,7 @@ void VoxelLodTerrain::ApplyMeshUpdateTask::run(TimeSpreadTaskContext &ctx) {
 	}
 
 	self->apply_mesh_update(data);
+	self->add_mesh_request_dirty_block(data.lod, data.position);
 }
 
 VoxelLodTerrain::VoxelLodTerrain() {
@@ -197,6 +198,7 @@ VoxelLodTerrain::VoxelLodTerrain() {
 
 VoxelLodTerrain::~VoxelLodTerrain() {
 	ZN_PRINT_VERBOSE("Destroy VoxelLodTerrain");
+	abort_mesh_requests();
 	abort_async_edits();
 	_streaming_dependency->valid = false;
 	_meshing_dependency->valid = false;
@@ -977,6 +979,7 @@ void VoxelLodTerrain::reset_maps() {
 
 void VoxelLodTerrain::reset_mesh_maps() {
 	_update_data->wait_for_end_of_task();
+	abort_mesh_requests();
 
 	const unsigned int lod_count = get_lod_count();
 	VoxelLodTerrainUpdateData::State &state = _update_data->state;
@@ -1178,6 +1181,7 @@ void VoxelLodTerrain::_notification(int p_what) {
 #endif
 
 		case NOTIFICATION_EXIT_TREE:
+			abort_mesh_requests();
 			break;
 
 		case NOTIFICATION_ENTER_WORLD: {
@@ -1434,6 +1438,7 @@ void VoxelLodTerrain::apply_main_thread_update_tasks() {
 
 		for (unsigned int i = 0; i < lod.mesh_blocks_to_activate_visuals.size(); ++i) {
 			const Vector3i bpos = lod.mesh_blocks_to_activate_visuals[i];
+			add_mesh_request_dirty_block(lod_index, bpos);
 			VoxelMeshBlockVLT *block = mesh_map.get_block(bpos);
 			// Can be null if there is actually no surface at this location
 			if (block == nullptr) {
@@ -1472,6 +1477,7 @@ void VoxelLodTerrain::apply_main_thread_update_tasks() {
 		}
 
 		for (const Vector3i bpos : lod.mesh_blocks_to_activate_collision) {
+			add_mesh_request_dirty_block(lod_index, bpos);
 			VoxelMeshBlockVLT *block = mesh_map.get_block(bpos);
 			// Can be null if there is actually no surface at this location
 			if (block == nullptr) {
@@ -1748,6 +1754,8 @@ void VoxelLodTerrain::apply_main_thread_update_tasks() {
 	_stats.time_io_requests = state.stats.time_io_requests;
 	_stats.time_mesh_requests = state.stats.time_mesh_requests;
 	_stats.time_update_task = state.stats.time_total;
+
+	process_mesh_requests();
 }
 
 void VoxelLodTerrain::apply_data_block_response(VoxelEngine::BlockDataOutput &ob) {
@@ -2530,6 +2538,7 @@ void VoxelLodTerrain::process_deferred_collision_updates(uint32_t timeout_msec) 
 				}
 
 				set_block_collision_shape(*this, *block, collision_shape, now);
+				add_mesh_request_dirty_block(lod_index, block_pos);
 
 				unordered_remove(deferred_collision_updates, i);
 				--i;
@@ -2869,6 +2878,214 @@ bool VoxelLodTerrain::is_area_meshed(const Box3i &box_in_voxels, unsigned int lo
 		const VoxelLodTerrainUpdateData::MeshBlockState &block = it->second;
 		return block.state == VoxelLodTerrainUpdateData::MESH_UP_TO_DATE;
 	});
+}
+
+Ref<VoxelMeshRequest> VoxelLodTerrain::request_area_meshing(
+		Box3i box_in_voxels,
+		bool require_visuals,
+		bool require_collisions
+) {
+	Ref<VoxelMeshRequest> request;
+	request.instantiate();
+
+	const int mesh_block_size = static_cast<int>(get_mesh_block_size());
+	const Vector3i half_size = box_in_voxels.size / 2;
+	const char *error = get_area_meshing_error(box_in_voxels, require_visuals, require_collisions);
+
+	if (error == nullptr) {
+		VoxelEngine &engine = VoxelEngine::get_singleton();
+		const ViewerID viewer_id = engine.add_viewer();
+
+		VoxelEngine::Viewer::Distances distances;
+		distances.horizontal = math::max(half_size.x, half_size.z) + mesh_block_size;
+		distances.vertical = half_size.y + mesh_block_size;
+		engine.set_viewer_distances(viewer_id, distances);
+		engine.set_viewer_requires_visuals(viewer_id, require_visuals);
+		engine.set_viewer_requires_collisions(viewer_id, require_collisions);
+
+		const Vector3 local_center = to_vec3(box_in_voxels.position) + to_vec3(box_in_voxels.size) * 0.5f;
+		engine.set_viewer_position(viewer_id, get_global_transform().xform(local_center));
+
+		request->init(viewer_id, box_in_voxels.downscaled(mesh_block_size), require_visuals, require_collisions);
+		_mesh_requests.push_back(request);
+
+	} else {
+		ZN_PRINT_ERROR(error);
+		request->finish_deferred(false);
+	}
+
+	return request;
+}
+
+// Returns why an area cannot be requested, or nullptr if it can
+const char *VoxelLodTerrain::get_area_meshing_error(
+		Box3i box_in_voxels,
+		bool require_visuals,
+		bool require_collisions
+) const {
+	const int mesh_block_size = static_cast<int>(get_mesh_block_size());
+	const Vector3i half_size = box_in_voxels.size / 2;
+	const int max_half_size = math::max(half_size.x, math::max(half_size.y, half_size.z));
+
+	const char *error = nullptr;
+	if (get_streaming_system() != STREAMING_SYSTEM_CLIPBOX) {
+		error = "request_area_meshing requires the clipbox streaming system";
+	} else if (_mesher.is_null()) {
+		error = "request_area_meshing requires a mesher";
+	} else if (!require_visuals && !require_collisions) {
+		error = "request_area_meshing requires visuals or collisions to be requested";
+	} else if (require_collisions && !get_generate_collisions()) {
+		error = "request_area_meshing requires generate_collisions when collisions are requested";
+	} else if (box_in_voxels.is_empty()) {
+		error = "request_area_meshing requires an area with a positive size on every axis";
+	} else if (!get_voxel_bounds().contains(box_in_voxels)) {
+		error = "request_area_meshing requires an area inside the voxel bounds";
+	} else if (static_cast<float>(max_half_size + mesh_block_size) > get_lod_distance()) {
+		// The clipbox LOD0 box around the viewer is driven by lod_distance, so the area must fit inside it
+		error = "request_area_meshing requires half the area size plus the mesh block size to be at most "
+				"lod_distance";
+	}
+	return error;
+}
+
+// Records a block whose load or activation state changed, if a request still waits for it.
+// Only LOD0 blocks are tracked by requests.
+void VoxelLodTerrain::add_mesh_request_dirty_block(unsigned int lod_index, Vector3i bpos) {
+	// Checked first because this runs for every activated mesh block of every LOD, while requests are rare
+	if (_mesh_requests.size() > 0 && lod_index == 0 && is_block_pending_in_mesh_requests(bpos)) {
+		_mesh_request_dirty_blocks.insert(bpos);
+	}
+}
+
+// Requests that did not run their initial check yet have no pending blocks, that check covers them instead
+bool VoxelLodTerrain::is_block_pending_in_mesh_requests(Vector3i bpos) const {
+	bool pending = false;
+	for (const Ref<VoxelMeshRequest> &request : _mesh_requests) {
+		if (request->pending_blocks.count(bpos) > 0) {
+			pending = true;
+			break;
+		}
+	}
+	return pending;
+}
+
+// Runs on the main thread after the update task completed, so mesh block states are consistent
+void VoxelLodTerrain::process_mesh_requests() {
+	// Leaves before taking the mesh map lock in the common case of a terrain without requests
+	if (_mesh_requests.size() == 0 && _mesh_request_dirty_blocks.size() == 0) {
+		return;
+	}
+
+	ZN_PROFILE_SCOPE();
+
+	{
+		// The update task is not running here. The lock is taken once to follow the access rule of MeshMapState,
+		// and released before signals are emitted.
+		const VoxelLodTerrainUpdateData::MeshMapState &mms = _update_data->state.lods[0].mesh_map_state;
+		RWLockRead rlock(mms.map_lock);
+
+		for (Ref<VoxelMeshRequest> &request : _mesh_requests) {
+			if (request->get_state() == VoxelMeshRequest::STATE_PENDING && !request->initial_check_done) {
+				init_mesh_request_pending_blocks(**request, mms);
+			}
+		}
+
+		for (const Vector3i bpos : _mesh_request_dirty_blocks) {
+			update_mesh_requests_at_block(bpos, mms);
+		}
+	}
+	_mesh_request_dirty_blocks.clear();
+
+	complete_and_remove_mesh_requests();
+}
+
+// Checks all blocks of a new request once, which covers blocks other viewers already loaded
+void VoxelLodTerrain::init_mesh_request_pending_blocks(
+		VoxelMeshRequest &request,
+		const VoxelLodTerrainUpdateData::MeshMapState &mms
+) const {
+	request.initial_check_done = true;
+	// Block count is known upfront, so the set is sized once instead of rehashing while filling
+	request.pending_blocks.reserve(static_cast<size_t>(Vector3iUtil::get_volume_u64(request.get_block_box().size)));
+	request.get_block_box().for_each_cell([this, &request, &mms](Vector3i bpos) {
+		if (!is_mesh_request_block_done(request, bpos, mms)) {
+			request.pending_blocks.insert(bpos);
+		}
+	});
+}
+
+void VoxelLodTerrain::update_mesh_requests_at_block(
+		Vector3i bpos,
+		const VoxelLodTerrainUpdateData::MeshMapState &mms
+) {
+	for (Ref<VoxelMeshRequest> &request : _mesh_requests) {
+		if (request->pending_blocks.count(bpos) > 0 && is_mesh_request_block_done(**request, bpos, mms)) {
+			request->pending_blocks.erase(bpos);
+		}
+	}
+}
+
+// Drops finished or released requests, then emits `completed` for the finished ones.
+// Emitting after the list was updated lets listeners add, release or abort requests safely.
+void VoxelLodTerrain::complete_and_remove_mesh_requests() {
+	StdVector<Ref<VoxelMeshRequest>> completed_requests;
+
+	for (unsigned int i = 0; i < _mesh_requests.size(); ++i) {
+		const VoxelMeshRequest &request = **_mesh_requests[i];
+		const bool released = request.get_state() != VoxelMeshRequest::STATE_PENDING;
+		const bool done = request.initial_check_done && request.pending_blocks.empty();
+		if (done && !released) {
+			completed_requests.push_back(_mesh_requests[i]);
+		}
+		if (done || released) {
+			unordered_remove(_mesh_requests, i);
+			--i;
+		}
+	}
+
+	for (Ref<VoxelMeshRequest> &request : completed_requests) {
+		// A listener of a previous request may have released this one meanwhile
+		if (request->get_state() == VoxelMeshRequest::STATE_PENDING) {
+			request->finish(true);
+		}
+	}
+}
+
+// A block is done when the requested features are loaded and active, and no collider update is deferred.
+// Empty blocks have no main thread mesh block, so the threaded state is the reference.
+// The caller holds the read lock of `mms`.
+bool VoxelLodTerrain::is_mesh_request_block_done(
+		const VoxelMeshRequest &request,
+		Vector3i bpos,
+		const VoxelLodTerrainUpdateData::MeshMapState &mms
+) const {
+	const VoxelMeshBlockVLT *block = _mesh_maps_per_lod[0].get_block(bpos);
+	const bool collider_deferred = block != nullptr && block->deferred_collider_data != nullptr;
+
+	auto it = mms.map.find(bpos);
+	bool done = false;
+	if (it != mms.map.end()) {
+		const VoxelLodTerrainUpdateData::MeshBlockState &state = it->second;
+		const bool visual_done = !request.requires_visuals() || (state.visual_loaded && state.visual_active);
+		const bool collision_done = !request.requires_collisions() ||
+				(state.collision_loaded && state.collision_active && !collider_deferred);
+		done = visual_done && collision_done;
+	}
+	return done;
+}
+
+// Fails every pending request, because the mesh maps they wait for are being reset or destroyed.
+// The list is emptied before emitting, so listeners can add new requests safely.
+void VoxelLodTerrain::abort_mesh_requests() {
+	StdVector<Ref<VoxelMeshRequest>> aborted_requests;
+	aborted_requests.swap(_mesh_requests);
+	_mesh_request_dirty_blocks.clear();
+
+	for (Ref<VoxelMeshRequest> &request : aborted_requests) {
+		if (request->get_state() == VoxelMeshRequest::STATE_PENDING) {
+			request->finish(false);
+		}
+	}
 }
 
 VoxelLodTerrain::StreamingSystem VoxelLodTerrain::get_streaming_system() const {
@@ -3983,6 +4200,17 @@ bool VoxelLodTerrain::_b_is_area_meshed(AABB aabb, int lod_index) const {
 	return is_area_meshed(Box3i(aabb.position, aabb.size), lod_index);
 }
 
+Ref<VoxelMeshRequest> VoxelLodTerrain::_b_request_area_meshing(
+		AABB aabb,
+		bool require_visuals,
+		bool require_collisions
+) {
+	// Rounds outwards, so every voxel touched by the AABB belongs to the requested area
+	const Box3i box_in_voxels =
+			Box3i::from_min_max(math::floor_to_int(aabb.position), math::ceil_to_int(aabb.position + aabb.size));
+	return request_area_meshing(box_in_voxels, require_visuals, require_collisions);
+}
+
 void VoxelLodTerrain::_bind_methods() {
 	using Self = VoxelLodTerrain;
 
@@ -4052,6 +4280,10 @@ void VoxelLodTerrain::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("is_stream_running_in_editor"), &Self::is_stream_running_in_editor);
 
 	ClassDB::bind_method(D_METHOD("is_area_meshed", "area_in_voxels", "lod_index"), &Self::_b_is_area_meshed);
+	ClassDB::bind_method(
+			D_METHOD("request_area_meshing", "area_in_voxels", "require_visuals", "require_collisions"),
+			&Self::_b_request_area_meshing
+	);
 
 	// Normalmaps
 

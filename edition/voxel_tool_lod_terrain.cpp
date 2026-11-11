@@ -797,8 +797,9 @@ PackedFloat32Array VoxelToolLodTerrain::get_column_terrain_tops(PackedVector3Arr
 	// found) rather than reading made-up data.
 	if (!is_area_editable(box)) {
 		result.resize(columns.size());
+		float *result_w = result.ptrw();
 		for (int i = 0; i < columns.size(); ++i) {
-			result.write[i] = NAN;
+			result_w[i] = NAN;
 		}
 		return result;
 	}
@@ -810,6 +811,7 @@ PackedFloat32Array VoxelToolLodTerrain::get_column_terrain_tops(PackedVector3Arr
 	defval.f = constants::SDF_FAR_OUTSIDE;
 
 	result.resize(columns.size());
+	float *result_w = result.ptrw();
 	for (int i = 0; i < columns.size(); ++i) {
 		const int probe_x = Math::floor(columns[i].x);
 		const int start_vy = Math::floor(columns[i].y);
@@ -840,7 +842,7 @@ PackedFloat32Array VoxelToolLodTerrain::get_column_terrain_tops(PackedVector3Arr
 			}
 			sdf_above = sdf;
 		}
-		result.write[i] = ground;
+		result_w[i] = ground;
 	}
 
 	return result;

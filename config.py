@@ -7,8 +7,14 @@ def can_build(env, platform):
     return True
 
 
+# Godot adds these to its own Variables object, which also reads `custom.py`.
+# It runs before `configure`, so the values are already in `env` by then.
+def get_opts(platform):
+    return common.get_scons_options(False)
+
+
 def configure(env):
-    common.register_scons_options(env, False)
+    pass
 
 
 def get_icons_path():

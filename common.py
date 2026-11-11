@@ -1,30 +1,57 @@
 import glob
 
 
+# Returns the list of SCons options this module understands.
+#
+# When compiling as a module, `config.get_opts` hands this to Godot's own
+# Variables object, which also reads `custom.py`. Defining the options in a
+# separate Variables object here would skip that file, so they could only be set
+# on the command line.
+def get_scons_options(is_extension):
+    from SCons.Script import BoolVariable
+
+    opts = [
+        BoolVariable("voxel_tests",
+            "Build with tests for the voxel module, which will run on startup of the engine", False),
+
+        BoolVariable("voxel_smooth_meshing", "Build with smooth voxels meshing support", True),
+        BoolVariable("voxel_modifiers", "Build with experimental modifiers support", True),
+        BoolVariable("voxel_sqlite", "Build with SQLite save stream support", True),
+        BoolVariable("voxel_instancer", "Build with VoxelInstancer support", True),
+        BoolVariable("voxel_gpu", "Build with GPU compute support", True),
+        BoolVariable("voxel_basic_generators", "Build with basic/example generators", True),
+        BoolVariable("voxel_mesh_sdf", "Build with mesh voxelization support", True),
+        BoolVariable("voxel_vox", "Build with support for loading .vox files", True),
+
+        # Set this when a host project supplies its own definition of
+        # zylann::voxel::register_extra_classes(). The module's no-op fallback is
+        # then left out of the build, because its definition in the same static
+        # library would satisfy the call before the linker reaches the host's.
+        BoolVariable("voxel_extra_classes",
+            "A host project provides register_extra_classes(); skip the built-in no-op", False),
+    ]
+
+    if not is_extension:
+        opts += [
+            BoolVariable("tracy", "Build with enabled Tracy Profiler integration", False),
+            BoolVariable("voxel_fast_noise_2", "Build FastNoise2 support (x86-only)", True),
+            BoolVariable("voxel_werror", "Explicitely enable warninngs as errors for module code only", False),
+        ]
+
+    return opts
+
+
+# Used when compiling as an extension, where there is no Godot build to hand the
+# options to. As a module, `config.get_opts` is used instead.
 def register_scons_options(env, is_extension):
-    from SCons.Script import BoolVariable, Variables, Help
+    from SCons.Script import Variables, Help
 
     env_vars = Variables()
 
-    env_vars.Add(BoolVariable("voxel_tests", 
-        "Build with tests for the voxel module, which will run on startup of the engine", False))
-    
-    env_vars.Add(BoolVariable("voxel_smooth_meshing", "Build with smooth voxels meshing support", True))
-    env_vars.Add(BoolVariable("voxel_modifiers", "Build with experimental modifiers support", True))
-    env_vars.Add(BoolVariable("voxel_sqlite", "Build with SQLite save stream support", True))
-    env_vars.Add(BoolVariable("voxel_instancer", "Build with VoxelInstancer support", True))
-    env_vars.Add(BoolVariable("voxel_gpu", "Build with GPU compute support", True))
-    env_vars.Add(BoolVariable("voxel_basic_generators", "Build with basic/example generators", True))
-    env_vars.Add(BoolVariable("voxel_mesh_sdf", "Build with mesh voxelization support", True))
-    env_vars.Add(BoolVariable("voxel_vox", "Build with support for loading .vox files", True))
-    
-    if not is_extension:
-        env_vars.Add(BoolVariable("tracy", "Build with enabled Tracy Profiler integration", False))
-        env_vars.Add(BoolVariable("voxel_fast_noise_2", "Build FastNoise2 support (x86-only)", True))
-        env_vars.Add(BoolVariable("voxel_werror", "Explicitely enable warninngs as errors for module code only", False))
+    for opt in get_scons_options(is_extension):
+        env_vars.Add(opt)
 
     env_vars.Update(env)
-
     Help(env_vars.GenerateHelpText(env))
 
 
@@ -50,6 +77,7 @@ def get_sources(env, is_editor_build):
     basic_generators_enabled = env["voxel_basic_generators"]
     voxel_mesh_sdf_enabled = env["voxel_mesh_sdf"]
     voxel_vox_enabled = env["voxel_vox"]
+    extra_classes_from_host = env["voxel_extra_classes"]
 
     if not smoosh_meshing_enabled:
         modifiers_enabled = False
@@ -152,6 +180,11 @@ def get_sources(env, is_editor_build):
         "thirdparty/lz4/*.c",
         # "thirdparty/sqlite/*.c",
     ]
+
+    if not extra_classes_from_host:
+        # No-op definition of register_extra_classes(), so builds without a host
+        # project still link. Left out otherwise, see the option's description.
+        sources += ["extra_class_registry.cpp"]
 
     if is_editor_build:
         sources += [

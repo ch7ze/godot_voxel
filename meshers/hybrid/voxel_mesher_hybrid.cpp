@@ -413,27 +413,36 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 
 		for (int z = 0; z < sz; ++z) {
 			for (int x = 0; x < sx; ++x) {
+				// The y loop walks a column upwards, so the voxel below is the one read in the
+				// previous iteration. Carrying it over replaces the second TYPE read per voxel.
+				bool below_is_model = false;
 				for (int y = 0; y < block_size.y; ++y) {
 					const uint64_t voxel_id = src.get_voxel(Vector3i(x, y, z), type_channel);
-					if (!is_rendered_model(voxel_id)) {
-						continue;
-					}
-					any_model = true;
+					const bool is_model = is_rendered_model(voxel_id);
 					// Stack-base test: only the lowest voxel of a stacked column triggers
 					// flattening. If `y == 0` we are at the bottom of the buffer (including its
 					// padding border); we conservatively treat that as a base. If the stack
 					// actually continues into the neighbour chunk below, that chunk owns the
 					// real base position and will flatten there.
-					const bool below_is_model =
-							y > 0 && is_rendered_model(src.get_voxel(Vector3i(x, y - 1, z), type_channel));
-					if (below_is_model) {
+					const bool is_stack_base = is_model && !below_is_model;
+					below_is_model = is_model;
+					if (!is_model) {
 						continue;
 					}
-					// Ground-proximity test: only the voxel DIRECTLY under the model voxel
-					// (`(x, y - 1, z)`) counts as ground. Neighbour columns do not count -- a
-					// block standing on a cliff edge gets no flattening just because the cliff
-					// is next to it; only blocks resting directly on a solid sample below them
-					// trigger flattening.
+					any_model = true;
+					if (!is_stack_base) {
+						continue;
+					}
+					// Ground-proximity test: the ground under the model voxel is the Transvoxel
+					// cell at `(x, y - 1, z)`, whose four LOWER corners are the samples
+					// (x..x+1, y-1, z..z+1). The test reads all four of them and passes as soon
+					// as one is solid, which matches the claim below: the claim covers all four
+					// corner columns of that same cell, so a one-sample test would reject cells
+					// that the terrain iso-surface crosses diagonally (cliff edges, ridges) even
+					// though the model does rest on ground there.
+					//
+					// Neighbour cells still do not count -- a block next to a cliff gets no
+					// flattening from the cliff, only the cell it actually stands on is read.
 					//
 					// If the test is positive, ALL FOUR corner columns are claimed (the bottom
 					// face is a quad and Transvoxel meshes it from 4 corner samples; claiming
@@ -448,12 +457,21 @@ bool VoxelMesherHybrid::build_flattened_sdf(VoxelBuffer &dst, const VoxelMesher:
 					}
 					// SDF convention: negative = solid (matches Pass 2 below and the generators
 					// that write sdf = world_y - height).
-					if (src.get_voxel_f(Vector3i(x, y - 1, z), sdf_channel) >= 0.0f) {
+					bool ground_below = false;
+					for (int gz = z; gz <= z + 1 && !ground_below; ++gz) {
+						for (int gx = x; gx <= x + 1 && !ground_below; ++gx) {
+							if (gx >= sx || gz >= sz) {
+								continue;
+							}
+							ground_below = src.get_voxel_f(Vector3i(gx, y - 1, gz), sdf_channel) < 0.0f;
+						}
+					}
+					if (!ground_below) {
 						continue;
 					}
 					for (int cz = z; cz <= z + 1; ++cz) {
 						for (int cx = x; cx <= x + 1; ++cx) {
-							if (cx < 0 || cx >= sx || cz < 0 || cz >= sz) {
+							if (cx >= sx || cz >= sz) {
 								continue;
 							}
 							int &slot = column_flatten_y[cx + cz * sx];

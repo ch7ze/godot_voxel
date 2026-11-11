@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/cz/git/godot-cpp/tools/**)",
+      "Read(//home/cz/git/godot-cpp/include/godot_cpp/classes/**)"
+    ]
+  }
+}

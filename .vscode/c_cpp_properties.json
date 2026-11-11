@@ -1,0 +1,10 @@
+{
+    "configurations": [
+        {
+            "name": "GDExtension",
+            "compileCommands": "${workspaceFolder}/compile_commands.json",
+            "cppStandard": "c++17"
+        }
+    ],
+    "version": 4
+}

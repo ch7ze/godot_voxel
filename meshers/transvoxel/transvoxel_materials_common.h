@@ -5,8 +5,13 @@
 
 namespace zylann::voxel::transvoxel::materials {
 
+// Each slot is cast to uint32_t before shifting. Without the cast, uint8_t is promoted to int, so a
+// slot value of 128 or more shifted by 24 leaves the representable int range, which is undefined
+// behavior. Material indices reach 255 since the Mixel4 index word moved to 8 bits per slot, and
+// weights already span 0..255.
 inline uint32_t pack_bytes(const FixedArray<uint8_t, 4> &a) {
-	return (a[0] | (a[1] << 8) | (a[2] << 16) | (a[3] << 24));
+	return (static_cast<uint32_t>(a[0]) << 0) | (static_cast<uint32_t>(a[1]) << 8) |
+			(static_cast<uint32_t>(a[2]) << 16) | (static_cast<uint32_t>(a[3]) << 24);
 }
 
 inline void add_4i8_4w8_texture_data(

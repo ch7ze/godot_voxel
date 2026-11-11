@@ -25,6 +25,10 @@ VoxelEngine &VoxelEngine::get_singleton() {
 	return *g_voxel_engine;
 }
 
+bool VoxelEngine::has_singleton() {
+	return g_voxel_engine != nullptr;
+}
+
 void VoxelEngine::create_singleton(Config config) {
 	ZN_ASSERT_MSG(g_voxel_engine == nullptr, "Creating singleton twice");
 	g_voxel_engine = ZN_NEW(VoxelEngine(config));

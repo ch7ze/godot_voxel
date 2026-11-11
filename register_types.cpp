@@ -9,6 +9,7 @@
 #include "edition/voxel_tool_lod_terrain.h"
 #include "edition/voxel_tool_terrain.h"
 #include "engine/voxel_engine_gd.h"
+#include "extra_class_registry.h"
 #include "generators/graph/node_type_db.h"
 #include "generators/graph/voxel_generator_graph.h"
 #include "generators/multipass/voxel_generator_multipass_cb.h"
@@ -40,6 +41,7 @@
 #include "terrain/fixed_lod/voxel_terrain_multiplayer_synchronizer.h"
 #include "terrain/variable_lod/voxel_lod_terrain.h"
 #include "terrain/voxel_a_star_grid_3d.h"
+#include "terrain/variable_lod/voxel_mesh_request.h"
 #include "terrain/voxel_mesh_block.h"
 #include "terrain/voxel_save_completion_tracker.h"
 #include "terrain/voxel_viewer.h"
@@ -319,6 +321,7 @@ void initialize_voxel_module(ModuleInitializationLevel p_level) {
 		ClassDB::register_class<ZN_ThreadedTask>();
 		ClassDB::register_class<VoxelTerrainMultiplayerSynchronizer>();
 		ClassDB::register_class<VoxelAStarGrid3D>();
+		ClassDB::register_class<VoxelMeshRequest>();
 
 		// Meshers
 		ClassDB::register_abstract_class<VoxelMesher>();
@@ -439,6 +442,10 @@ void initialize_voxel_module(ModuleInitializationLevel p_level) {
 			}
 		}
 #endif
+
+		// Classes contributed by sources outside this repository. Runs last, so
+		// everything this module provides is already registered.
+		register_extra_classes();
 	}
 
 #ifdef TOOLS_ENABLED

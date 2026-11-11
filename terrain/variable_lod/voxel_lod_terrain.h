@@ -6,6 +6,7 @@
 #include "../../storage/voxel_data.h"
 #include "../../util/containers/std_map.h"
 #include "../../util/containers/std_unordered_map.h"
+#include "../../util/containers/std_unordered_set.h"
 #include "../../util/containers/std_vector.h"
 #include "../voxel_mesh_map.h"
 #include "../voxel_node.h"
@@ -13,6 +14,7 @@
 #include "shader_material_pool_vlt.h"
 #include "voxel_lod_terrain_update_data.h"
 #include "voxel_mesh_block_vlt.h"
+#include "voxel_mesh_request.h"
 
 #ifdef TOOLS_ENABLED
 #include "../../util/godot/debug_renderer.h"
@@ -214,6 +216,10 @@ public:
 
 	bool is_area_meshed(const Box3i &box_in_voxels, unsigned int lod_index) const;
 
+	// Requests meshes of an area at LOD0 through an internal engine viewer. The returned request emits `completed`
+	// once every LOD0 mesh block of the area is loaded and active. Requires the clipbox streaming system.
+	Ref<VoxelMeshRequest> request_area_meshing(Box3i box_in_voxels, bool require_visuals, bool require_collisions);
+
 	enum StreamingSystem : uint8_t { //
 		STREAMING_SYSTEM_LEGACY_OCTREE = VoxelLodTerrainUpdateData::STREAMING_SYSTEM_LEGACY_OCTREE,
 		STREAMING_SYSTEM_CLIPBOX = VoxelLodTerrainUpdateData::STREAMING_SYSTEM_CLIPBOX
@@ -354,6 +360,23 @@ private:
 	void process_deferred_collision_updates(uint32_t timeout_msec);
 	void process_fading_blocks(float delta);
 
+	const char *get_area_meshing_error(Box3i box_in_voxels, bool require_visuals, bool require_collisions) const;
+	void add_mesh_request_dirty_block(unsigned int lod_index, Vector3i bpos);
+	bool is_block_pending_in_mesh_requests(Vector3i bpos) const;
+	void process_mesh_requests();
+	void init_mesh_request_pending_blocks(
+			VoxelMeshRequest &request,
+			const VoxelLodTerrainUpdateData::MeshMapState &mms
+	) const;
+	void update_mesh_requests_at_block(Vector3i bpos, const VoxelLodTerrainUpdateData::MeshMapState &mms);
+	void complete_and_remove_mesh_requests();
+	bool is_mesh_request_block_done(
+			const VoxelMeshRequest &request,
+			Vector3i bpos,
+			const VoxelLodTerrainUpdateData::MeshMapState &mms
+	) const;
+	void abort_mesh_requests();
+
 	struct LocalCameraInfo {
 		Vector3 position;
 		Vector3 forward;
@@ -378,6 +401,7 @@ private:
 	int /*Error*/ _b_debug_dump_as_scene(String fpath, bool include_instancer) const;
 
 	bool _b_is_area_meshed(AABB aabb, int lod_index) const;
+	Ref<VoxelMeshRequest> _b_request_area_meshing(AABB aabb, bool require_visuals, bool require_collisions);
 
 	Dictionary _b_get_statistics() const;
 
@@ -426,6 +450,12 @@ private:
 	float _collision_margin = constants::DEFAULT_COLLISION_MARGIN;
 	int _collision_update_delay = 0;
 	FixedArray<StdVector<Vector3i>, constants::MAX_LOD> _deferred_collision_updates_per_lod;
+
+	// Pending requests from request_area_meshing(), only accessed on the main thread
+	StdVector<Ref<VoxelMeshRequest>> _mesh_requests;
+	// LOD0 mesh blocks whose load or activation state changed since requests were last evaluated.
+	// A set, because one block can change visuals, collisions and its deferred collider in the same frame.
+	StdUnorderedSet<Vector3i> _mesh_request_dirty_blocks;
 
 	float _lod_fade_duration = 0.f;
 	// Note, direct pointers to mesh blocks should be safe because these blocks are always destroyed from the same
