@@ -315,9 +315,6 @@ pub struct SdfField {
     /// Negated real SDF values, in ZXY order. Negative means outside.
     /// Source: meshers/transvoxel/transvoxel.cpp:133-147, `sdf_as_float`
     values: Vec<f32>,
-    /// Raw channel values as reals, in ZXY order, used for cell rejection.
-    /// Source: meshers/transvoxel/transvoxel.cpp:242
-    raw_values: Vec<f32>,
     size: IVec3,
 }
 
@@ -330,13 +327,11 @@ impl SdfField {
         let depth = voxels.depth(channel);
 
         let mut values = Vec::with_capacity(volume);
-        let mut raw_values = Vec::with_capacity(volume);
         match voxels.uniform_value(channel) {
             Some(_) => {
                 let raw = voxels.get_voxel_f(IVec3::ZERO, channel);
                 // `sdf_as_float` negates, so the whole block holds one value
                 values.resize(volume, -raw);
-                raw_values.resize(volume, raw);
             }
             None => {
                 let bytes = voxels
@@ -347,16 +342,11 @@ impl SdfField {
                     let raw_bits = read_raw_at(bytes, i, step, depth);
                     let raw = voxel_core::channel::raw_voxel_to_real(raw_bits, depth);
                     values.push(-raw);
-                    raw_values.push(raw);
                 }
             }
         }
 
-        SdfField {
-            values,
-            raw_values,
-            size,
-        }
+        SdfField { values, size }
     }
 
     #[inline]
@@ -369,11 +359,16 @@ impl SdfField {
         self.values[index]
     }
 
-    /// Raw channel value, used only for the early cell rejection comparison.
-    /// Source: meshers/transvoxel/transvoxel.cpp:242
+    /// Whether the raw channel value at a sample lies above the isolevel.
+    ///
+    /// The C++ code compares the undecoded channel value against zero
+    /// (`transvoxel.cpp:242`). The stored values are the negated reals, so
+    /// `raw > 0` is exactly `-raw < 0`, which holds for every float including
+    /// both signed zeros and the infinities.
+    /// Source: meshers/transvoxel/transvoxel.cpp:235-242
     #[inline]
-    pub fn get_raw(&self, index: usize) -> f32 {
-        self.raw_values[index]
+    pub fn raw_is_above_isolevel(&self, index: usize) -> bool {
+        self.values[index] < 0.0
     }
 
     /// Central-difference gradient at a sample, pointing out of the surface.
@@ -453,9 +448,6 @@ pub fn build_regular_mesh<P: MaterialProcessor>(
     let n011 = n010 + n001;
     let n111 = n100 + n010 + n001;
 
-    // The isolevel of the negated field is zero
-    let isolevel = 0.0f32;
-
     for z in min_pos.z..max_pos.z {
         for y in min_pos.y..max_pos.y {
             let mut data_index = zxy_index(
@@ -472,14 +464,14 @@ pub fn build_regular_mesh<P: MaterialProcessor>(
                 // samples equal the isolevel and four do not. `>` must match
                 // the comparison used for case selection.
                 // Source: meshers/transvoxel/transvoxel.cpp:235-241
-                let s = sdf.get_raw(data_index) > isolevel;
-                if (sdf.get_raw(data_index + n010) > isolevel) == s
-                    && (sdf.get_raw(data_index + n100) > isolevel) == s
-                    && (sdf.get_raw(data_index + n110) > isolevel) == s
-                    && (sdf.get_raw(data_index + n001) > isolevel) == s
-                    && (sdf.get_raw(data_index + n011) > isolevel) == s
-                    && (sdf.get_raw(data_index + n101) > isolevel) == s
-                    && (sdf.get_raw(data_index + n111) > isolevel) == s
+                let s = sdf.raw_is_above_isolevel(data_index);
+                if sdf.raw_is_above_isolevel(data_index + n010) == s
+                    && sdf.raw_is_above_isolevel(data_index + n100) == s
+                    && sdf.raw_is_above_isolevel(data_index + n110) == s
+                    && sdf.raw_is_above_isolevel(data_index + n001) == s
+                    && sdf.raw_is_above_isolevel(data_index + n011) == s
+                    && sdf.raw_is_above_isolevel(data_index + n101) == s
+                    && sdf.raw_is_above_isolevel(data_index + n111) == s
                 {
                     // Not crossing the isolevel, no geometry here
                     data_index += n100;
@@ -831,7 +823,6 @@ pub fn build_transition_mesh<P: MaterialProcessor>(
     let fn02 = 2 * fn01;
 
     let fz = MIN_PADDING;
-    let isolevel = 0.0f32;
     let transition_hint_mask = 1u8 << get_face_index(direction);
 
     let mut fy = min_fpos_y;
@@ -849,17 +840,18 @@ pub fn build_transition_mesh<P: MaterialProcessor>(
                 block_size_with_padding,
             ) as isize;
 
-            let at = |offset: isize| sdf.get_raw((data_index + offset) as usize);
+            let above =
+                |offset: isize| sdf.raw_is_above_isolevel((data_index + offset) as usize);
 
-            let s = at(0) > isolevel;
-            if (at(fn10) > isolevel) == s
-                && (at(fn20) > isolevel) == s
-                && (at(fn01) > isolevel) == s
-                && (at(fn11) > isolevel) == s
-                && (at(fn21) > isolevel) == s
-                && (at(fn02) > isolevel) == s
-                && (at(fn12) > isolevel) == s
-                && (at(fn22) > isolevel) == s
+            let s = above(0);
+            if above(fn10) == s
+                && above(fn20) == s
+                && above(fn01) == s
+                && above(fn11) == s
+                && above(fn21) == s
+                && above(fn02) == s
+                && above(fn12) == s
+                && above(fn22) == s
             {
                 fx += 2;
                 continue;

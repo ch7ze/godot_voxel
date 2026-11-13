@@ -15,7 +15,7 @@ use bevy::shader::ShaderRef;
 use crate::mesh::{ATTRIBUTE_LOD_DATA, ATTRIBUTE_MATERIAL_ID};
 
 /// Path of the shader inside the asset folder.
-pub const SHADER_PATH: &str = "shaders/voxel_terrain.wgsl";
+pub const SHADER_PATH: &str = "shaders/voxel_terrain.wesl";
 
 /// Number of colour slots the shader holds.
 /// Source: shaders/voxel_mesher_hybrid_shader.h:10
@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn the_shader_path_points_at_the_wgsl_file() {
-        assert_eq!(SHADER_PATH, "shaders/voxel_terrain.wgsl");
+    fn the_shader_path_points_at_the_wesl_file() {
+        assert_eq!(SHADER_PATH, "shaders/voxel_terrain.wesl");
     }
 }

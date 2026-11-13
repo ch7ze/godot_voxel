@@ -110,7 +110,17 @@ pub fn surface_to_mesh(surface: &Surface, asset_usage: RenderAssetUsages) -> Opt
         _ => {}
     }
 
-    mesh.insert_indices(Indices::U32(surface.indices.clone()));
+    // The mesher emits the winding Godot treats as front facing, while wgpu
+    // takes counter clockwise triangles as the front face and bevy culls the
+    // back face. Each triangle is therefore reversed.
+    // Source: meshers/transvoxel/transvoxel.cpp:589-591,
+    // wgpu-types-30.0.1/src/render.rs:334-339,
+    // bevy_pbr-0.20.1/src/render/mesh.rs:3775
+    let mut indices = surface.indices.clone();
+    for triangle in indices.chunks_exact_mut(3) {
+        triangle.swap(0, 2);
+    }
+    mesh.insert_indices(Indices::U32(indices));
 
     Some(mesh)
 }
@@ -238,8 +248,10 @@ mod tests {
         let mesh = surface_to_mesh(&surface, usage()).unwrap();
         assert_eq!(mesh.primitive_topology(), PrimitiveTopology::TriangleList);
         assert_eq!(mesh.count_vertices(), 3);
+        // Each triangle is reversed so the winding matches wgpu's counter
+        // clockwise front face
         match mesh.indices() {
-            Some(Indices::U32(indices)) => assert_eq!(indices, &vec![0u32, 1, 2]),
+            Some(Indices::U32(indices)) => assert_eq!(indices, &vec![2u32, 1, 0]),
             other => panic!("unexpected indices {other:?}"),
         }
     }

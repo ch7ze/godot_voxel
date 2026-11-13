@@ -205,49 +205,145 @@ pub fn transition_mask_from_neighbour_lods(
     mask
 }
 
-/// LOD a chunk should be loaded at, given its distance to the viewer.
+/// LOD level the ring layout assigns to a world position.
 ///
-/// Each LOD level doubles the distance at which it takes over, which keeps the
-/// screen-space error roughly constant.
-pub fn lod_for_distance(
-    distance_in_chunks: f32,
-    lod_count: u32,
-    view_distance_in_chunks: u32,
+/// The finest ring whose reach contains the position wins, which mirrors how
+/// `chunks_in_view` drops chunks the finer ring already covers.
+pub fn lod_at_world_position(
+    settings: &VoxelWorldSettings,
+    world_position: Vec3,
+    viewer_position: Vec3,
 ) -> u32 {
-    if lod_count <= 1 || view_distance_in_chunks == 0 {
-        return 0;
+    let lod_count = settings.lod_count.max(1);
+    let mut level = lod_count - 1;
+    // The finest level whose chunk at this position is actually loaded wins.
+    // Testing the chunk the position falls into, rather than the position
+    // itself, keeps this in step with `chunks_in_view`, which drops a chunk
+    // only when the finer ring spans all of it.
+    for lod_index in 0..lod_count {
+        let world_size = settings.chunk_world_size(lod_index);
+        let chunk_position = (world_position / world_size).floor().as_ivec3();
+        let chunk = ChunkPosition::new(chunk_position, lod_index);
+        if covered_by_finer_lod(settings, chunk, viewer_position) {
+            continue;
+        }
+        if chunk_is_in_ring(settings, chunk, viewer_position) {
+            level = lod_index;
+            break;
+        }
     }
-    let normalized = distance_in_chunks / view_distance_in_chunks as f32;
-    if normalized <= 1.0 {
-        return 0;
+    level
+}
+
+/// Whether a chunk overlaps its own LOD ring around the viewer.
+///
+/// The ring is the axis aligned cube of half extent
+/// `lod_reach_in_world_units` centred on the viewer. A cube keeps the rings
+/// nesting exactly, since every reach is a power of two multiple of the finer
+/// levels' chunk sizes, which a sphere would break.
+pub fn chunk_is_in_ring(
+    settings: &VoxelWorldSettings,
+    chunk: ChunkPosition,
+    viewer_position: Vec3,
+) -> bool {
+    let reach = lod_reach_in_world_units(settings, chunk.lod_index);
+    let (min_corner, max_corner) = chunk_box_around_viewer(settings, chunk, viewer_position);
+    min_corner.max_element() < reach && max_corner.min_element() > -reach
+}
+
+/// Transition mask of one chunk under the ring layout.
+///
+/// Each of the six sides is probed at the centre of the neighbouring chunk.
+/// A side whose neighbour sits at a coarser level gets its bit set, so the
+/// mesher stitches that side.
+/// Source: shaders/voxel_mesher_hybrid_shader.h:17-23
+pub fn transition_mask_for_chunk(
+    settings: &VoxelWorldSettings,
+    chunk: ChunkPosition,
+    viewer_position: Vec3,
+) -> u8 {
+    let world_size = settings.chunk_world_size(chunk.lod_index);
+    let centre = (chunk.position.as_vec3() + Vec3::splat(0.5)) * world_size;
+
+    let mut neighbour_lods = [None; 6];
+    for (side, normal) in voxel_core::cube::SIDE_NORMALS.iter().enumerate() {
+        let neighbour_centre = centre + normal.as_vec3() * world_size;
+        neighbour_lods[side] =
+            Some(lod_at_world_position(settings, neighbour_centre, viewer_position));
     }
-    let level = normalized.log2().floor().max(0.0) as u32 + 1;
-    level.min(lod_count - 1)
+    transition_mask_from_neighbour_lods(chunk.lod_index, neighbour_lods)
+}
+
+/// World space reach of one LOD ring, in world units.
+///
+/// Every level spans `view_distance_in_chunks` of its own chunks, which are
+/// twice as large per level, so each ring reaches twice as far as the one
+/// below it.
+pub fn lod_reach_in_world_units(settings: &VoxelWorldSettings, lod_index: u32) -> f32 {
+    settings.view_distance_in_chunks as f32 * settings.chunk_world_size(lod_index)
+}
+
+/// World space box a chunk occupies, relative to the viewer.
+fn chunk_box_around_viewer(
+    settings: &VoxelWorldSettings,
+    chunk: ChunkPosition,
+    viewer_position: Vec3,
+) -> (Vec3, Vec3) {
+    let world_size = settings.chunk_world_size(chunk.lod_index);
+    let min_corner = chunk.position.as_vec3() * world_size - viewer_position;
+    (min_corner, min_corner + Vec3::splat(world_size))
+}
+
+/// Whether the next finer LOD level already covers all of a chunk.
+///
+/// Each ring is an axis aligned cube in world space, and its reach is a power
+/// of two multiple of every finer level's chunk size. The rings therefore
+/// nest exactly, and a chunk fully inside the finer cube is covered without
+/// any remainder.
+pub fn covered_by_finer_lod(
+    settings: &VoxelWorldSettings,
+    chunk: ChunkPosition,
+    viewer_position: Vec3,
+) -> bool {
+    if chunk.lod_index == 0 {
+        return false;
+    }
+    let inner_reach = lod_reach_in_world_units(settings, chunk.lod_index - 1);
+    let (min_corner, max_corner) = chunk_box_around_viewer(settings, chunk, viewer_position);
+    min_corner.min_element() >= -inner_reach && max_corner.max_element() <= inner_reach
 }
 
 /// Chunk positions that should be loaded for a viewer position.
+///
+/// One ring is produced per LOD level. Level 0 sits closest to the viewer,
+/// each coarser level forms a shell around the finer ones, and chunks the
+/// finer ring already covers are left out.
 pub fn chunks_in_view(
     settings: &VoxelWorldSettings,
     viewer_position: Vec3,
 ) -> Vec<ChunkPosition> {
     let mut out = Vec::new();
-    let radius = settings.view_distance_in_chunks as i32;
-    let chunk_size = settings.chunk_size as f32;
-    let center = (viewer_position / chunk_size).floor().as_ivec3();
+    // One chunk of slack, a chunk may overlap the ring cube without its own
+    // origin lying inside the searched box
+    let radius = settings.view_distance_in_chunks as i32 + 1;
+    let lod_count = settings.lod_count.max(1);
 
-    let area = Box3i::from_center_extents(center, IVec3::splat(radius));
-    area.for_each_cell_zxy(|position| {
-        let offset = (position - center).as_vec3();
-        let distance = offset.length();
-        if distance <= radius as f32 {
-            let lod = lod_for_distance(
-                distance,
-                settings.lod_count,
-                settings.view_distance_in_chunks,
-            );
-            out.push(ChunkPosition::new(position, lod));
-        }
-    });
+    for lod_index in 0..lod_count {
+        let world_size = settings.chunk_world_size(lod_index);
+        let center = (viewer_position / world_size).floor().as_ivec3();
+        let area = Box3i::from_center_extents(center, IVec3::splat(radius));
+
+        area.for_each_cell_zxy(|position| {
+            let chunk = ChunkPosition::new(position, lod_index);
+            if !chunk_is_in_ring(settings, chunk, viewer_position) {
+                return;
+            }
+            if covered_by_finer_lod(settings, chunk, viewer_position) {
+                return;
+            }
+            out.push(chunk);
+        });
+    }
     out
 }
 
@@ -283,10 +379,16 @@ impl LoadedChunks {
     }
 
     /// Chunks that are loaded but no longer wanted.
-    pub fn surplus(&self, wanted: &[ChunkPosition]) -> Vec<ChunkPosition> {
+    ///
+    /// The wanted set is a hash set so the scan stays linear in the number of
+    /// loaded chunks, a slice would make it quadratic.
+    pub fn surplus(
+        &self,
+        wanted: &std::collections::HashSet<ChunkPosition>,
+    ) -> Vec<ChunkPosition> {
         self.entries
             .keys()
-            .filter(|chunk| !wanted.contains(chunk))
+            .filter(|chunk| !wanted.contains(*chunk))
             .copied()
             .collect()
     }
@@ -303,6 +405,7 @@ pub fn update_chunk_set(
         return;
     };
     let wanted = chunks_in_view(&settings, viewer.translation);
+    let wanted_set: std::collections::HashSet<ChunkPosition> = wanted.iter().copied().collect();
 
     for chunk in &wanted {
         if loaded.contains(*chunk) {
@@ -310,18 +413,24 @@ pub fn update_chunk_set(
         }
         let world_size = settings.chunk_world_size(chunk.lod_index);
         let translation = chunk.position.as_vec3() * world_size;
+        let mask = transition_mask_for_chunk(&settings, *chunk, viewer.translation);
         let entity = commands
             .spawn((
                 *chunk,
                 ChunkState::Pending,
-                TransitionMask::default(),
+                TransitionMask(mask),
                 Transform::from_translation(translation),
+                // The surfaces are spawned as children, so the chunk itself
+                // carries the visibility its children inherit.
+                // Source: bevy_camera-0.20.1/src/visibility/mod.rs:499,
+                // bevy_transform-0.20.1/src/plugins.rs:24
+                Visibility::default(),
             ))
             .id();
         loaded.insert(*chunk, entity);
     }
 
-    for chunk in loaded.surplus(&wanted) {
+    for chunk in loaded.surplus(&wanted_set) {
         if let Some(entity) = loaded.remove(chunk) {
             commands.entity(entity).despawn();
         }
@@ -376,19 +485,30 @@ pub fn start_meshing_tasks(
 pub fn collect_meshing_tasks(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut tasks: Query<(Entity, &mut MeshingTask, &mut ChunkState)>,
+    mut tasks: Query<(Entity, &mut MeshingTask, &TransitionMask, &mut ChunkState)>,
 ) {
-    for (entity, mut task, mut state) in tasks.iter_mut() {
+    for (entity, mut task, mask, mut state) in tasks.iter_mut() {
         let Some(output) = block_on(poll_once(&mut task.0)) else {
             continue;
         };
 
         commands.entity(entity).remove::<MeshingTask>();
 
-        let chunk_meshes = crate::mesh::output_to_meshes(
-            &output,
-            bevy::asset::RenderAssetUsages::default(),
-        );
+        let usage = bevy::asset::RenderAssetUsages::default();
+        let mut chunk_meshes = crate::mesh::output_to_meshes(&output, usage);
+
+        // The transition meshes of the stitched sides are rendered alongside
+        // the regular ones. The shader culls the triangles of any side whose
+        // bit is absent from the mask, so only the stitched sides show.
+        // Source: shaders/voxel_mesher_hybrid_shader.h:28-40
+        let per_side = crate::mesh::output_to_transition_meshes(&output, usage);
+        for (side, side_meshes) in per_side.into_iter().enumerate() {
+            if mask.0 & (1 << side) == 0 {
+                continue;
+            }
+            chunk_meshes.extend(side_meshes);
+        }
+
         if chunk_meshes.is_empty() {
             *state = ChunkState::Empty;
             continue;
@@ -400,6 +520,7 @@ pub fn collect_meshing_tasks(
                 Mesh3d(handle),
                 ChunkSurface {
                     material_index: chunk_mesh.material_index,
+                    transition_mask: mask.0,
                 },
             ));
         }
@@ -411,6 +532,10 @@ pub fn collect_meshing_tasks(
 #[derive(Debug, Clone, Copy, Component)]
 pub struct ChunkSurface {
     pub material_index: u16,
+    /// Transition mask of the owning chunk, which the shader needs so it can
+    /// stitch the stitched sides and cull the rest.
+    /// Source: shaders/voxel_mesher_hybrid_shader.h:17-23
+    pub transition_mask: u8,
 }
 
 /// Registers the chunk layer with an app.
@@ -597,43 +722,107 @@ mod tests {
     }
 
     #[test]
+    fn each_lod_ring_reaches_twice_as_far_as_the_one_below() {
+        let s = VoxelWorldSettings {
+            chunk_size: 16,
+            view_distance_in_chunks: 4,
+            lod_count: 3,
+            ..settings()
+        };
+        assert_eq!(lod_reach_in_world_units(&s, 0), 64.0);
+        assert_eq!(lod_reach_in_world_units(&s, 1), 128.0);
+        assert_eq!(lod_reach_in_world_units(&s, 2), 256.0);
+    }
+
+    #[test]
     fn a_single_lod_level_always_selects_lod_zero() {
-        assert_eq!(lod_for_distance(100.0, 1, 4), 0);
+        let s = VoxelWorldSettings {
+            lod_count: 1,
+            view_distance_in_chunks: 4,
+            ..settings()
+        };
+        assert_eq!(
+            lod_at_world_position(&s, Vec3::new(10_000.0, 0.0, 0.0), Vec3::ZERO),
+            0
+        );
     }
 
     #[test]
     fn the_lod_rises_with_the_distance() {
-        // Within the view distance the finest level applies
-        assert_eq!(lod_for_distance(1.0, 4, 4), 0);
-        assert_eq!(lod_for_distance(4.0, 4, 4), 0);
-        // Beyond it each doubling raises the level
-        assert_eq!(lod_for_distance(5.0, 4, 4), 1);
-        assert_eq!(lod_for_distance(9.0, 4, 4), 2);
-        assert_eq!(lod_for_distance(17.0, 4, 4), 3);
+        let s = VoxelWorldSettings {
+            chunk_size: 16,
+            view_distance_in_chunks: 4,
+            lod_count: 3,
+            ..settings()
+        };
+        // The rings are world space cubes, level 0 reaching 64 units
+        assert_eq!(lod_at_world_position(&s, Vec3::new(10.0, 0.0, 0.0), Vec3::ZERO), 0);
+        assert_eq!(lod_at_world_position(&s, Vec3::new(63.0, 0.0, 0.0), Vec3::ZERO), 0);
+        // Level 1 takes over at the boundary and reaches 128
+        assert_eq!(lod_at_world_position(&s, Vec3::new(64.0, 0.0, 0.0), Vec3::ZERO), 1);
+        assert_eq!(lod_at_world_position(&s, Vec3::new(127.0, 0.0, 0.0), Vec3::ZERO), 1);
+        // Level 2 from there on
+        assert_eq!(lod_at_world_position(&s, Vec3::new(128.0, 0.0, 0.0), Vec3::ZERO), 2);
     }
 
     #[test]
     fn the_lod_is_capped_at_the_level_count() {
-        assert_eq!(lod_for_distance(10_000.0, 3, 4), 2);
+        let s = VoxelWorldSettings {
+            view_distance_in_chunks: 4,
+            lod_count: 3,
+            ..settings()
+        };
+        assert_eq!(
+            lod_at_world_position(&s, Vec3::new(10_000.0, 0.0, 0.0), Vec3::ZERO),
+            2
+        );
     }
 
     #[test]
-    fn chunks_in_view_cover_a_sphere_around_the_viewer() {
+    fn the_lod_follows_the_viewer() {
         let s = VoxelWorldSettings {
+            chunk_size: 16,
+            view_distance_in_chunks: 4,
+            lod_count: 3,
+            ..settings()
+        };
+        let viewer = Vec3::new(1000.0, 0.0, 0.0);
+        // Right at the viewer the finest level applies
+        assert_eq!(lod_at_world_position(&s, viewer, viewer), 0);
+        // The same world position is coarse when the viewer is far away
+        assert_eq!(lod_at_world_position(&s, viewer, Vec3::ZERO), 2);
+    }
+
+    #[test]
+    fn chunks_in_view_cover_a_cube_around_the_viewer() {
+        let s = VoxelWorldSettings {
+            chunk_size: 16,
             view_distance_in_chunks: 2,
             lod_count: 1,
             ..settings()
         };
         let chunks = chunks_in_view(&s, Vec3::ZERO);
         assert!(!chunks.is_empty());
-        // Every chunk lies within the radius
+
+        // Level 0 reaches 32 world units, so chunks -2..1 are covered
+        let reach = lod_reach_in_world_units(&s, 0);
+        assert_eq!(reach, 32.0);
         for chunk in &chunks {
-            let distance = chunk.position.as_vec3().length();
-            assert!(distance <= 2.0 + 1e-6, "chunk {:?} too far", chunk.position);
             assert_eq!(chunk.lod_index, 0);
+            for axis in 0..3 {
+                let min_corner = chunk.position[axis] as f32 * s.chunk_size as f32;
+                let max_corner = min_corner + s.chunk_size as f32;
+                assert!(
+                    min_corner < reach && max_corner > -reach,
+                    "chunk {:?} lies outside the ring",
+                    chunk.position
+                );
+            }
         }
         // The chunk holding the viewer is included
         assert!(chunks.iter().any(|c| c.position == IVec3::ZERO));
+        // The cube spans exactly four chunks per axis
+        assert_eq!(chunks.len(), 4 * 4 * 4);
     }
 
     #[test]
@@ -652,13 +841,250 @@ mod tests {
     #[test]
     fn distant_chunks_get_a_coarser_lod() {
         let s = VoxelWorldSettings {
+            chunk_size: 16,
+            view_distance_in_chunks: 3,
+            lod_count: 3,
+            ..settings()
+        };
+        let chunks = chunks_in_view(&s, Vec3::ZERO);
+
+        // Every level produces chunks
+        for lod_index in 0..3 {
+            assert!(
+                chunks.iter().any(|c| c.lod_index == lod_index),
+                "no chunk at lod {lod_index}"
+            );
+        }
+
+        // The chunk holding the viewer is the finest one
+        assert!(chunks
+            .iter()
+            .any(|c| c.position == IVec3::ZERO && c.lod_index == 0));
+
+        // Coarse chunks sit outside the reach of the finer ring
+        let inner_reach = lod_reach_in_world_units(&s, 0);
+        for chunk in chunks.iter().filter(|c| c.lod_index == 1) {
+            let world_size = s.chunk_world_size(1);
+            let min_corner = chunk.position.as_vec3() * world_size;
+            let max_corner = min_corner + Vec3::splat(world_size);
+            assert!(
+                min_corner.abs().max(max_corner.abs()).max_element() > inner_reach,
+                "chunk {:?} at lod 1 lies inside the lod 0 ring",
+                chunk.position
+            );
+        }
+    }
+
+    #[test]
+    fn a_coarse_chunk_inside_the_finer_ring_is_dropped() {
+        let s = VoxelWorldSettings {
+            chunk_size: 16,
+            view_distance_in_chunks: 4,
+            lod_count: 2,
+            ..settings()
+        };
+        // Lod 0 reaches 64 world units, a lod 1 chunk spans 32, so chunk
+        // (0,0,0) at lod 1 covers 0..32 and lies fully inside
+        assert!(covered_by_finer_lod(
+            &s,
+            ChunkPosition::new(IVec3::ZERO, 1),
+            Vec3::ZERO
+        ));
+        // Chunk (2,0,0) at lod 1 covers 64..96, which reaches beyond
+        assert!(!covered_by_finer_lod(
+            &s,
+            ChunkPosition::new(IVec3::new(2, 0, 0), 1),
+            Vec3::ZERO
+        ));
+        // Level 0 is never covered
+        assert!(!covered_by_finer_lod(
+            &s,
+            ChunkPosition::new(IVec3::ZERO, 0),
+            Vec3::ZERO
+        ));
+    }
+
+    #[test]
+    fn no_two_chunks_in_view_cover_the_same_volume_twice() {
+        let s = VoxelWorldSettings {
+            chunk_size: 16,
+            view_distance_in_chunks: 3,
+            lod_count: 3,
+            ..settings()
+        };
+        let chunks = chunks_in_view(&s, Vec3::ZERO);
+        // Each entry is unique, so the loaded set stays idempotent
+        let unique: std::collections::HashSet<ChunkPosition> =
+            chunks.iter().copied().collect();
+        assert_eq!(unique.len(), chunks.len());
+    }
+
+    #[test]
+    fn a_chunk_bordering_a_coarser_ring_gets_a_transition_mask() {
+        let s = VoxelWorldSettings {
+            chunk_size: 16,
+            view_distance_in_chunks: 4,
+            lod_count: 2,
+            ..settings()
+        };
+        // Lod 0 reaches 64 world units. Chunk (3,0,0) spans 48..64, its
+        // positive x neighbour centre sits at 72, which falls into lod 1.
+        let mask = transition_mask_for_chunk(
+            &s,
+            ChunkPosition::new(IVec3::new(3, 0, 0), 0),
+            Vec3::ZERO,
+        );
+        // Side 0 is positive x
+        // Source: voxel-core/src/cube.rs:57, :124-131
+        assert_ne!(mask & (1 << 0), 0, "mask {mask:#08b}");
+        // The negative x neighbour stays at lod 0
+        assert_eq!(mask & (1 << 1), 0, "mask {mask:#08b}");
+    }
+
+    #[test]
+    fn a_chunk_well_inside_the_finest_ring_has_no_transitions() {
+        let s = VoxelWorldSettings {
+            chunk_size: 16,
+            view_distance_in_chunks: 4,
+            lod_count: 2,
+            ..settings()
+        };
+        let mask =
+            transition_mask_for_chunk(&s, ChunkPosition::new(IVec3::ZERO, 0), Vec3::ZERO);
+        assert_eq!(mask, 0);
+    }
+
+    #[test]
+    fn no_two_loaded_chunks_overlap_in_world_space() {
+        // Overlapping chunks of different levels would draw the same terrain
+        // twice, which shows as z-fighting and doubled geometry
+        let s = VoxelWorldSettings {
+            chunk_size: 16,
             view_distance_in_chunks: 2,
             lod_count: 3,
             ..settings()
         };
         let chunks = chunks_in_view(&s, Vec3::ZERO);
-        // Inside the view distance everything stays at lod 0
-        assert!(chunks.iter().all(|c| c.lod_index == 0));
+
+        let world_box = |chunk: &ChunkPosition| {
+            let size = s.chunk_world_size(chunk.lod_index);
+            let min_corner = chunk.position.as_vec3() * size;
+            (min_corner, min_corner + Vec3::splat(size))
+        };
+
+        for (index, a) in chunks.iter().enumerate() {
+            let (a_min, a_max) = world_box(a);
+            for b in &chunks[index + 1..] {
+                if a.lod_index == b.lod_index {
+                    continue;
+                }
+                let (b_min, b_max) = world_box(b);
+                let overlaps = (0..3).all(|axis| {
+                    a_min[axis] < b_max[axis] && b_min[axis] < a_max[axis]
+                });
+                assert!(
+                    !overlaps,
+                    "chunk {:?} lod {} overlaps {:?} lod {}",
+                    a.position, a.lod_index, b.position, b.lod_index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_rings_leave_no_gap_between_levels() {
+        // A gap would show as missing terrain at the ring boundary
+        let s = VoxelWorldSettings {
+            chunk_size: 16,
+            view_distance_in_chunks: 2,
+            lod_count: 3,
+            ..settings()
+        };
+        let chunks = chunks_in_view(&s, Vec3::ZERO);
+        let loaded: std::collections::HashSet<ChunkPosition> =
+            chunks.iter().copied().collect();
+
+        // Sample the whole covered volume, every point must belong to exactly
+        // one loaded chunk
+        let outer_reach = lod_reach_in_world_units(&s, s.lod_count - 1);
+        let step = s.chunk_size as f32;
+        let samples = (outer_reach / step) as i32;
+        for iz in -samples..samples {
+            for iy in -samples..samples {
+                for ix in -samples..samples {
+                    let point = Vec3::new(
+                        ix as f32 * step + step * 0.5,
+                        iy as f32 * step + step * 0.5,
+                        iz as f32 * step + step * 0.5,
+                    );
+                    let count = (0..s.lod_count)
+                        .filter(|lod_index| {
+                            let size = s.chunk_world_size(*lod_index);
+                            let position = (point / size).floor().as_ivec3();
+                            loaded.contains(&ChunkPosition::new(position, *lod_index))
+                        })
+                        .count();
+                    assert_eq!(count, 1, "point {point:?} covered {count} times");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_probed_neighbour_lod_matches_a_loaded_chunk() {
+        // The transition mask is only correct when the level reported for a
+        // neighbour position is the level that position is actually loaded at
+        let s = VoxelWorldSettings {
+            chunk_size: 16,
+            view_distance_in_chunks: 4,
+            lod_count: 3,
+            ..settings()
+        };
+        let viewer = Vec3::ZERO;
+        let loaded: std::collections::HashSet<ChunkPosition> =
+            chunks_in_view(&s, viewer).into_iter().collect();
+
+        for chunk in &loaded {
+            let world_size = s.chunk_world_size(chunk.lod_index);
+            let centre = (chunk.position.as_vec3() + Vec3::splat(0.5)) * world_size;
+
+            for normal in voxel_core::cube::SIDE_NORMALS.iter() {
+                let probe = centre + normal.as_vec3() * world_size;
+                let predicted = lod_at_world_position(&s, probe, viewer);
+
+                // The chunk that actually holds this position, if any
+                let actual = (0..s.lod_count).find(|lod_index| {
+                    let size = s.chunk_world_size(*lod_index);
+                    let position = (probe / size).floor().as_ivec3();
+                    loaded.contains(&ChunkPosition::new(position, *lod_index))
+                });
+
+                if let Some(actual) = actual {
+                    assert_eq!(
+                        predicted, actual,
+                        "probe {probe:?} from chunk {:?} lod {}",
+                        chunk.position, chunk.lod_index
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_lod_level_produces_no_transitions() {
+        let s = VoxelWorldSettings {
+            view_distance_in_chunks: 4,
+            lod_count: 1,
+            ..settings()
+        };
+        for x in -4..=4 {
+            let mask = transition_mask_for_chunk(
+                &s,
+                ChunkPosition::new(IVec3::new(x, 0, 0), 0),
+                Vec3::ZERO,
+            );
+            assert_eq!(mask, 0, "at x {x}");
+        }
     }
 
     #[test]
@@ -680,7 +1106,8 @@ mod tests {
         let drop = ChunkPosition::new(IVec3::new(9, 9, 9), 0);
         loaded.insert(keep, Entity::from_raw_u32(1).unwrap());
         loaded.insert(drop, Entity::from_raw_u32(2).unwrap());
-        let surplus = loaded.surplus(&[keep]);
+        let wanted: std::collections::HashSet<ChunkPosition> = [keep].into_iter().collect();
+        let surplus = loaded.surplus(&wanted);
         assert_eq!(surplus, vec![drop]);
     }
 
@@ -691,7 +1118,8 @@ mod tests {
         let coarse = ChunkPosition::new(IVec3::ZERO, 1);
         loaded.insert(fine, Entity::from_raw_u32(1).unwrap());
         assert!(!loaded.contains(coarse));
-        assert_eq!(loaded.surplus(&[coarse]), vec![fine]);
+        let wanted: std::collections::HashSet<ChunkPosition> = [coarse].into_iter().collect();
+        assert_eq!(loaded.surplus(&wanted), vec![fine]);
     }
 
     #[test]

@@ -8,11 +8,11 @@
 //   2. Per-vertex colour lookup from the material id.
 // Source: shaders/voxel_mesher_hybrid_shader.h:16-50
 
-#import bevy_pbr::{
-    mesh_functions,
-    view_transformations::position_world_to_clip,
-    forward_io::VertexOutput,
-}
+// Module paths follow the embedded asset paths bevy_pbr registers for its
+// shader libraries, see bevy_asset embedded/mod.rs:276 and
+// bevy_shader shader.rs:180-189.
+import bevy_pbr::render::mesh_functions;
+import bevy_pbr::render::view_transformations::position_world_to_clip;
 
 const MATERIAL_COLOR_COUNT: u32 = 8u;
 
@@ -28,7 +28,11 @@ struct VoxelTerrainMaterial {
     _padding: vec2<f32>,
 }
 
-@group(2) @binding(0) var<uniform> material: VoxelTerrainMaterial;
+// Group 2 holds the mesh bindings in bevy 0.20.1, the material sits in the
+// group named by MATERIAL_BIND_GROUP.
+// Source: bevy_pbr-0.20.1/src/material.rs:75,
+// bevy_pbr-0.20.1/src/render/pbr_bindings.wesl:42
+@group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> material: VoxelTerrainMaterial;
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
